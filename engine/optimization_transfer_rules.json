@@ -1,0 +1,205 @@
+{
+  "version": 1,
+  "description": "When an optimization (dflash, mtp/mtplx, triattention, …) is proven on one artifact, how it transfers to related models (quant, finetune, abliterated, same-arch sibling). NOT whole-family recipe cloning — per-accel applicability with expected acceptance degradation.",
+  "relation_types": {
+    "same_artifact": "Exact same weights path/HF id",
+    "same_base_quant": "Different quant of same base (4bit vs 8bit vs mxfp4)",
+    "same_base_finetune": "Abliterated / uncensored / SFT of same base",
+    "same_family_sibling": "Same HF family tree (base_model filter), not same weights",
+    "same_arch_class": "Same Transformers arch_class only (weak — default deny for head-based accels)",
+    "cross_family": "Different base model (default deny)"
+  },
+  "accelerators": {
+    "dflash": {
+      "kind": "external_draft",
+      "requires": ["draft_model_or_engine_default"],
+      "notes": "Block diffusion draft; acceptance depends on target logits matching draft training distribution.",
+      "transfer": {
+        "same_artifact": { "status": "proven", "acceptance_mult": 1.0, "confidence": "measured" },
+        "same_base_quant": {
+          "status": "likely",
+          "acceptance_mult": 0.92,
+          "confidence": "inferred",
+          "caveat": "Quant noise can slightly lower accept rate; re-measure avg_accepted_tokens."
+        },
+        "same_base_finetune": {
+          "status": "degraded",
+          "acceptance_mult": 0.65,
+          "confidence": "inferred",
+          "caveat": "Finetune/abliteration shifts residual stream; draft trained on base often loses accept rate. Verify before trusting speedup."
+        },
+        "same_family_sibling": {
+          "status": "experimental",
+          "acceptance_mult": 0.5,
+          "confidence": "pointer",
+          "caveat": "Only if draft is for that sibling; never reuse another size's draft head blindly."
+        },
+        "same_arch_class": {
+          "status": "deny",
+          "acceptance_mult": 0.0,
+          "confidence": "pointer",
+          "caveat": "DFlash draft is model-specific (z-lab / SubSir heads). Same arch ≠ transferable draft."
+        },
+        "cross_family": { "status": "deny", "acceptance_mult": 0.0, "confidence": "pointer" }
+      }
+    },
+    "mtp": {
+      "kind": "native_or_engine_mtp",
+      "requires": ["native_mtp_heads_or_engine_support"],
+      "notes": "Native multi-token prediction heads or engine MTP path.",
+      "transfer": {
+        "same_artifact": { "status": "proven", "acceptance_mult": 1.0, "confidence": "measured" },
+        "same_base_quant": {
+          "status": "likely",
+          "acceptance_mult": 0.9,
+          "confidence": "inferred",
+          "caveat": "Heads quantize with body; slight accept drop possible."
+        },
+        "same_base_finetune": {
+          "status": "degraded",
+          "acceptance_mult": 0.55,
+          "confidence": "inferred",
+          "caveat": "Finetunes often train only main LM head; MTP heads may be stale or dropped. Expect less acceptance than base — re-bench."
+        },
+        "same_family_sibling": {
+          "status": "experimental",
+          "acceptance_mult": 0.4,
+          "confidence": "pointer",
+          "caveat": "Sibling may not ship MTP weights; check config for mtp/num_nextn_predict_layers."
+        },
+        "same_arch_class": {
+          "status": "experimental",
+          "acceptance_mult": 0.3,
+          "confidence": "pointer",
+          "caveat": "Arch supports MTP ≠ this checkpoint has trained heads."
+        },
+        "cross_family": { "status": "deny", "acceptance_mult": 0.0, "confidence": "pointer" }
+      }
+    },
+    "mtplx": {
+      "kind": "engine_mtp",
+      "requires": ["mtplx_engine", "native_mtp_heads"],
+      "notes": "MTPLX Leviathan-Chen acceptance on native MTP; lossless when heads present.",
+      "transfer": {
+        "same_artifact": { "status": "proven", "acceptance_mult": 1.0, "confidence": "measured" },
+        "same_base_quant": {
+          "status": "likely",
+          "acceptance_mult": 0.88,
+          "confidence": "inferred",
+          "caveat": "Prefer same quant family as measured recipe."
+        },
+        "same_base_finetune": {
+          "status": "degraded",
+          "acceptance_mult": 0.5,
+          "confidence": "inferred",
+          "caveat": "Finetune may preserve MTP tensors but acceptance drops when chat/tool distribution shifts."
+        },
+        "same_family_sibling": {
+          "status": "experimental",
+          "acceptance_mult": 0.35,
+          "confidence": "pointer"
+        },
+        "same_arch_class": { "status": "deny", "acceptance_mult": 0.0, "confidence": "pointer" },
+        "cross_family": { "status": "deny", "acceptance_mult": 0.0, "confidence": "pointer" }
+      }
+    },
+    "triattention": {
+      "kind": "kv_compression",
+      "requires": ["per_model_calibration_pt"],
+      "notes": "Eviction KV; needs per-model calibration stats file.",
+      "transfer": {
+        "same_artifact": { "status": "proven", "acceptance_mult": 1.0, "confidence": "measured" },
+        "same_base_quant": {
+          "status": "degraded",
+          "acceptance_mult": 0.7,
+          "confidence": "inferred",
+          "caveat": "Calibration .pt is quant-sensitive; re-calibrate for new quant."
+        },
+        "same_base_finetune": {
+          "status": "degraded",
+          "acceptance_mult": 0.5,
+          "confidence": "inferred",
+          "caveat": "Must re-calibrate on finetune; do not reuse base .pt blindly."
+        },
+        "same_family_sibling": { "status": "deny", "acceptance_mult": 0.0, "confidence": "pointer" },
+        "same_arch_class": { "status": "deny", "acceptance_mult": 0.0, "confidence": "pointer" },
+        "cross_family": { "status": "deny", "acceptance_mult": 0.0, "confidence": "pointer" }
+      }
+    },
+    "turboquant": {
+      "kind": "runtime_quant_path",
+      "requires": ["engine_support"],
+      "notes": "Runtime path; more portable across quants than draft heads.",
+      "transfer": {
+        "same_artifact": { "status": "proven", "acceptance_mult": 1.0, "confidence": "measured" },
+        "same_base_quant": { "status": "likely", "acceptance_mult": 0.95, "confidence": "inferred" },
+        "same_base_finetune": { "status": "likely", "acceptance_mult": 0.9, "confidence": "inferred" },
+        "same_family_sibling": { "status": "experimental", "acceptance_mult": 0.7, "confidence": "pointer" },
+        "same_arch_class": { "status": "experimental", "acceptance_mult": 0.6, "confidence": "pointer" },
+        "cross_family": { "status": "experimental", "acceptance_mult": 0.5, "confidence": "pointer" }
+      }
+    },
+    "jaccl": {
+      "kind": "topology",
+      "requires": ["rdma_mesh", "model_sharded_or_replicated"],
+      "notes": "Multi-node; not an acceptance-rate accel — transfer is about topology readiness.",
+      "transfer": {
+        "same_artifact": { "status": "proven", "acceptance_mult": 1.0, "confidence": "measured" },
+        "same_base_quant": { "status": "likely", "acceptance_mult": 1.0, "confidence": "inferred", "caveat": "Same mesh rules; path must exist on all ranks." },
+        "same_base_finetune": { "status": "likely", "acceptance_mult": 1.0, "confidence": "inferred" },
+        "same_family_sibling": { "status": "likely", "acceptance_mult": 1.0, "confidence": "inferred" },
+        "same_arch_class": { "status": "experimental", "acceptance_mult": 0.8, "confidence": "pointer" },
+        "cross_family": { "status": "experimental", "acceptance_mult": 0.8, "confidence": "pointer" }
+      }
+    },
+    "ddtree": {
+      "kind": "spec_tree",
+      "requires": ["spec_decode_stack"],
+      "notes": "Code-biased tree; weak on prose.",
+      "transfer": {
+        "same_artifact": { "status": "proven", "acceptance_mult": 1.0, "confidence": "measured" },
+        "same_base_quant": { "status": "likely", "acceptance_mult": 0.9, "confidence": "inferred" },
+        "same_base_finetune": {
+          "status": "degraded",
+          "acceptance_mult": 0.6,
+          "confidence": "inferred",
+          "caveat": "Tool/code finetunes may help; chat finetunes may hurt tree accept."
+        },
+        "same_family_sibling": { "status": "experimental", "acceptance_mult": 0.45, "confidence": "pointer" },
+        "same_arch_class": { "status": "deny", "acceptance_mult": 0.0, "confidence": "pointer" },
+        "cross_family": { "status": "deny", "acceptance_mult": 0.0, "confidence": "pointer" }
+      }
+    },
+    "prompt_cache": {
+      "kind": "runtime",
+      "transfer": {
+        "same_artifact": { "status": "proven", "acceptance_mult": 1.0, "confidence": "measured" },
+        "same_base_quant": { "status": "likely", "acceptance_mult": 1.0, "confidence": "inferred" },
+        "same_base_finetune": { "status": "likely", "acceptance_mult": 1.0, "confidence": "inferred" },
+        "same_family_sibling": { "status": "likely", "acceptance_mult": 1.0, "confidence": "inferred" },
+        "same_arch_class": { "status": "likely", "acceptance_mult": 1.0, "confidence": "inferred" },
+        "cross_family": { "status": "likely", "acceptance_mult": 1.0, "confidence": "inferred" }
+      }
+    },
+    "continuous_batching": {
+      "kind": "runtime",
+      "transfer": {
+        "same_artifact": { "status": "proven", "acceptance_mult": 1.0, "confidence": "measured" },
+        "same_base_quant": { "status": "likely", "acceptance_mult": 1.0, "confidence": "inferred" },
+        "same_base_finetune": { "status": "likely", "acceptance_mult": 1.0, "confidence": "inferred" },
+        "same_family_sibling": { "status": "likely", "acceptance_mult": 1.0, "confidence": "inferred" },
+        "same_arch_class": { "status": "likely", "acceptance_mult": 0.9, "confidence": "inferred" },
+        "cross_family": { "status": "likely", "acceptance_mult": 0.9, "confidence": "inferred" }
+      }
+    }
+  },
+  "relation_detection": {
+    "finetune_name_markers": [
+      "abliterat", "uncensor", "heretic", "sft", "dpo", "rlhf", "instruct-tuned",
+      "wasserstein", "apex", "ornith", "holo", "luffy"
+    ],
+    "quant_name_markers": [
+      "4bit", "8bit", "6bit", "3bit", "mxfp4", "nvfp4", "gguf", "awq", "gptq", "fp8", "mixed"
+    ]
+  }
+}

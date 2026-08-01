@@ -1,0 +1,26 @@
+# model-kb golden queries — Phase A freeze (2026-07-11)
+version: 1
+queries:
+  - id: q-dflash-4bit-35b
+    q: "4bit dflash qwen 35b"
+    top_k: 5
+    require_any_name_regex: ["(?i)35B-A3B", "(?i)qwen3[.]?[56].*35"]
+    require_accel: [dflash]
+    require_quant_in: [4bit]
+  - id: q-minimax-jaccl
+    q: "mxfp4 minimax jaccl"
+    top_k: 5
+    require_any_name_regex: ["(?i)minimax"]
+    require_backend_in: [jaccl]
+    require_quant_in: [mxfp4]
+  - id: q-recipe-count
+    type: unit
+    assert: "len(records where kind==serve_recipe) >= 20"
+  - id: q-serve-request-no-auto
+    type: unit
+    assert: "recipe_to_serve_request(*) .backend in {single,jaccl} and != auto"
+
+  - id: q-quant-decimal-bit
+    type: unit
+    assert: "normalize_quant('3.6bit').label == '3.6bit' and normalize_quant('6bit').label == '6bit'"
+    note: "regression: 6bit regex must not match inside 3.6bit (Kimi)"

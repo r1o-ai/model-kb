@@ -1,0 +1,12 @@
+model-kb-kit 1.0.0 — 2026-08-01
+Model serving knowledge base: 456 anonymized reference records + ingest pipeline + BM25 search.
+Verified: setup → seed → index → search end-to-end.
+Added over the source deployment:
+  - scripts/kb-guard.py — makes the ordering trap visible BEFORE it destroys the corpus
+      plan   → exit 4 with an exact loss count (410/456 on the seed)
+      verify → exit 5, detects a fired trap from corpus shape alone
+      backup → timestamped snapshot
+  - data/records.seed.jsonl — anonymized (hostnames → node-N, paths → /path/to/models/)
+  - setup.sh refuses to overwrite an existing corpus
+  - schema.md copied as CONTENT (was a symlink into a private dir)
+  - excluded: .venv, 11 records.jsonl backups, prebuilt index.pkl, __pycache__

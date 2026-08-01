@@ -1,0 +1,29 @@
+# Derived/heavy artifacts — regenerate, never commit
+*.npy
+vectors*.json
+vector_ids*.json
+embed_hashes*.json
+bm25_index/
+*.pkl
+
+# The corpus is USER data, not kit source
+corpus/
+engine/records.jsonl
+
+# Backups + env
+*.bak
+*.bak-*
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Seed IS shipped; the live corpus is not
+!data/records.seed.jsonl
