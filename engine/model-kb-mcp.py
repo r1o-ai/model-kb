@@ -37,6 +37,28 @@ ASMI_URL = os.getenv("ASMI_URL", "http://127.0.0.1:9090")
 R1O_URL = os.getenv("R1O_URL", "http://localhost:59408")
 
 
+def _recipe_score(rec: dict) -> float:
+    """Measured agg_tps dominates. Unmeasured is not slow — it just loses to a sibling with numbers."""
+    benches = rec.get("benchmarks") or []
+    tps = 0.0
+    for b in benches:
+        if not isinstance(b, dict):
+            continue
+        v = b.get("agg_tps")
+        if isinstance(v, (int, float)) and v > tps:
+            tps = float(v)
+    s = tps * 100.0
+    if benches:
+        s += 50.0
+    s += 20.0 * len(rec.get("verified_on") or [])
+    if (rec.get("artifact") or {}).get("path"):
+        s += 15.0
+    s += 8.0 * sum(1 for a in (rec.get("accelerators") or []) if isinstance(a, dict) and a.get("enabled"))
+    if "active" in (rec.get("roles_fit") or []):
+        s += 5.0
+    return s
+
+
 def _find(records: list[dict], recipe_id: str) -> dict | None:
     rid = recipe_id.removeprefix("recipe:")
     for r in records:
@@ -44,7 +66,23 @@ def _find(records: list[dict], recipe_id: str) -> dict | None:
             return r
         if (r.get("source") or {}).get("serve_config_name") in (rid, recipe_id):
             return r
-    return None
+    lower = rid.lower()
+    exact: list[dict] = []
+    partial: list[dict] = []
+    for r in records:
+        if r.get("kind") not in (None, "serve_recipe"):
+            continue
+        art = r.get("artifact") or {}
+        name = str(art.get("name") or "").lower()
+        hf = str(art.get("hf_id") or "").lower()
+        if hf == lower or name == lower:
+            exact.append(r)
+        elif lower in name or lower in hf:
+            partial.append(r)
+    pool = exact or partial
+    if not pool:
+        return None
+    return max(pool, key=_recipe_score)
 
 
 def _http_json(method: str, url: str, body: dict | None = None, timeout: float = 120.0):
