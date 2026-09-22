@@ -25,5 +25,12 @@ venv/
 # macOS
 .DS_Store
 
+# Obsidian runtime (keep app/core-plugins; not the workspace)
+vault/.obsidian/workspace.json
+vault/.obsidian/workspace-mobile.json
+vault/.obsidian/graph.json
+vault/.obsidian/cache
+vault/attachments/
+
 # Seed IS shipped; the live corpus is not
 !data/records.seed.jsonl

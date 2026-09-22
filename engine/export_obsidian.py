@@ -1,24 +1,36 @@
 #!/usr/bin/env python3
-"""Export model-kb records.jsonl to an Obsidian notebook in the wiki atlas.
+"""Export model-kb records.jsonl to an Obsidian notebook.
 
-Source: ~/infra/model-kb/records.jsonl (serve_recipe + cloud_context records)
-Dest:   ~/wiki/atlas/model-kb/
-  _index.md          — map of content (recipes by family, cloud by provider)
-  recipes/<id>.md    — one note per serve_recipe
-  cloud/<id>.md      — one note per cloud_context
+Default dest is the personal wiki atlas. Pass --dest to export into this
+repo's `vault/` (or anywhere). Only generated subdirs are replaced:
+recipes/, cloud/, hubs/, _index.md. Authored notes (research/, templates/,
+engines/, HOWTO.md) are left alone.
 
-Re-runnable: full regenerate, deterministic order, no timestamps in output
-except the record's own `created` fields. Safe to cron after KB ingests.
+  python3 export_obsidian.py
+  python3 export_obsidian.py --records data/records.seed.jsonl --dest ../vault
+  python3 export_obsidian.py --kinds serve_recipe
 """
 
+from __future__ import annotations
+
+import argparse
 import json
+import os
 import re
 import shutil
 import sys
 from pathlib import Path
 
-KB_RECORDS = Path.home() / "infra/model-kb/records.jsonl"
-ATLAS = Path.home() / "wiki/atlas/model-kb"
+HOME = Path.home()
+# Live fleet defaults — override with flags. Product home is ~/.r1o/model-kb;
+# ~/infra/model-kb is the legacy path.
+_DEFAULT_RECORDS = Path(os.environ.get("MODEL_KB_RECORDS", str(HOME / ".r1o/model-kb/records.jsonl")))
+if not _DEFAULT_RECORDS.exists():
+    _DEFAULT_RECORDS = HOME / "infra/model-kb/records.jsonl"
+_DEFAULT_DEST = Path(os.environ.get("MODEL_KB_VAULT", str(HOME / "wiki/atlas/model-kb")))
+
+KB_RECORDS = _DEFAULT_RECORDS
+ATLAS = _DEFAULT_DEST
 
 ENGINE_LINKS = {
     "ds4": "[[ds4-serve-ops]] · [[ds4-engine]]",
@@ -191,9 +203,11 @@ def card_relations(rec):
     return ["## Relations", "", " · ".join(hub_link(d, v) for d, v in rels), ""]
 
 
-def load_records():
+def load_records(path: Path):
+    if not path.exists():
+        raise SystemExit(f"records not found: {path}")
     recs = []
-    with KB_RECORDS.open() as f:
+    with path.open() as f:
         for line in f:
             line = line.strip()
             if line:
@@ -427,7 +441,8 @@ def build_index(recipes, clouds):
         "# model-kb — Obsidian Export",
         "",
         f"{len(recipes)} serve recipes · {len(clouds)} cloud contexts. "
-        "Source of truth: `~/infra/model-kb/records.jsonl` (regenerate: `python3 ~/infra/model-kb/export_obsidian.py`).",
+        "Generated from `records.jsonl`. Authored research lives in `research/`. "
+        "Regenerate: `python3 engine/export_obsidian.py --dest vault`.",
         "",
         "## Serve Recipes",
         "",
@@ -463,19 +478,37 @@ def build_index(recipes, clouds):
     return "\n".join(parts)
 
 
-def main():
-    recs = load_records()
-    recipes = [r for r in recs if r.get("kind") == "serve_recipe"]
-    clouds = [r for r in recs if r.get("kind") == "cloud_context"]
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="export_obsidian")
+    ap.add_argument("--records", type=Path, default=_DEFAULT_RECORDS,
+                    help="records.jsonl (env MODEL_KB_RECORDS, else ~/.r1o then ~/infra)")
+    ap.add_argument("--dest", type=Path, default=_DEFAULT_DEST,
+                    help="Obsidian folder (env MODEL_KB_VAULT, else ~/wiki/atlas/model-kb)")
+    ap.add_argument("--kinds", default="serve_recipe,cloud_context",
+                    help="comma list of kinds to export, or 'all'")
+    args = ap.parse_args(argv)
 
-    if ATLAS.exists():
-        shutil.rmtree(ATLAS)
-    (ATLAS / "recipes").mkdir(parents=True)
-    (ATLAS / "cloud").mkdir(parents=True)
-    (ATLAS / "hubs").mkdir(parents=True)
+    kinds = {k.strip() for k in args.kinds.split(",") if k.strip()}
+    if "all" in kinds:
+        kinds = {"serve_recipe", "cloud_context"}
 
+    recs = load_records(args.records)
+    recipes = [r for r in recs if r.get("kind") == "serve_recipe"] if "serve_recipe" in kinds else []
+    clouds = [r for r in recs if r.get("kind") == "cloud_context"] if "cloud_context" in kinds else []
+
+    dest: Path = args.dest
+    dest.mkdir(parents=True, exist_ok=True)
+    # Only wipe generated subdirs — never authored research/templates/engines.
+    for sub in ("recipes", "cloud", "hubs"):
+        p = dest / sub
+        if p.exists():
+            shutil.rmtree(p)
+        p.mkdir(parents=True)
+
+    VALID_HUBS.clear()
     hubs = {}
-    for r in recs:
+    exportable = recipes + clouds
+    for r in exportable:
         for dim, v in relations_of(r):
             hubs.setdefault(hub_key(dim, v), (dim, v, []))[2].append(r)
     singles = 0
@@ -484,18 +517,19 @@ def main():
             singles += 1  # a hub of one connects nothing — skip
             continue
         VALID_HUBS.add(key)
-        (ATLAS / "hubs" / f"{key}.md").write_text(hub_note(dim, v, members))
+        (dest / "hubs" / f"{key}.md").write_text(hub_note(dim, v, members))
 
     for r in recipes:
-        (ATLAS / "recipes" / f"{slug(r)}.md").write_text(recipe_note(r))
+        (dest / "recipes" / f"{slug(r)}.md").write_text(recipe_note(r))
     for r in clouds:
-        (ATLAS / "cloud" / f"{slug(r)}.md").write_text(cloud_note(r))
+        (dest / "cloud" / f"{slug(r)}.md").write_text(cloud_note(r))
 
-    (ATLAS / "_index.md").write_text(build_index(recipes, clouds))
+    (dest / "_index.md").write_text(build_index(recipes, clouds))
 
     written = len(hubs) - singles
     print(f"exported {len(recipes)} recipes + {len(clouds)} cloud contexts "
-          f"+ {written} hubs ({singles} single-member skipped) → {ATLAS}")
+          f"+ {written} hubs ({singles} single-member skipped) → {dest}")
+    return 0
 
 
 if __name__ == "__main__":

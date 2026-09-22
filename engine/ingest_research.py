@@ -78,11 +78,16 @@ def expand_corpus(glob_file: Path) -> list[Path]:
         # graph-indexer py is not a research note — skip for note parse
         if line.endswith("param_researcher.py"):
             continue
-        pattern = str(HOME / line) if not line.startswith("/") else line
-        for m in globmod.glob(pattern):
-            p = Path(m)
-            if p.is_file() and p.suffix.lower() in {".md", ".markdown"}:
-                hits.append(p)
+        if line.startswith("/"):
+            patterns = [line]
+        else:
+            # Repo-relative first (this kit's vault/), then $HOME (wiki/atlas/…).
+            patterns = [str(ROOT.parent / line), str(HOME / line)]
+        for pattern in patterns:
+            for m in globmod.glob(pattern):
+                p = Path(m)
+                if p.is_file() and p.suffix.lower() in {".md", ".markdown"}:
+                    hits.append(p)
     # unique, stable
     return sorted(set(hits), key=lambda p: str(p))
 

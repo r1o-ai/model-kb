@@ -1,0 +1,10 @@
+# model-kb research corpus
+# Paths: absolute, relative to repo root, or relative to $HOME.
+# A note not matched here is invisible to ingest_research.py.
+
+# This kit's Obsidian vault (authored research)
+vault/research/**/*.md
+vault/engines/**/*.md
+
+# Personal wiki (live fleet) — ignored if those paths do not exist
+wiki/atlas/concepts/research/inference/*.md

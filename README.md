@@ -1,9 +1,14 @@
-# model-kb kit — a knowledge base for *how to actually serve a model*
+# model-kb — a knowledge base for *how to actually serve a model*
 
 Most model metadata tells you what a model **is** (params, license, architecture).
 This tells you what it **does on real hardware**: which quant, which engine, how many nodes,
 what it measured, and what broke. It is the corpus behind a serving advisor — searchable by
 plain questions like *"MoE that fits on 2 nodes with mxfp4"*.
+
+**UI contract:** [`schema/types.ts`](schema/types.ts) + [`engine/schema.md`](engine/schema.md).
+Implement against `records.jsonl` / the MCP tools. Do not parse the markdown vault.
+
+**Research notebook:** [`vault/`](vault/) is an Obsidian vault. Write findings in `vault/research/`. Generated recipe notes are optional (`export_obsidian.py --dest vault`).
 
 ```bash
 ./setup.sh                                        # deps + seed corpus + index
@@ -107,16 +112,15 @@ destroyed by the next `recipes` run, and you will not find out until a search co
 
 ```
 setup.sh                     installer — will not overwrite an existing corpus
-data/records.seed.jsonl      456 anonymized records (hostnames → node-N)
+data/records.seed.jsonl      anonymized records (hostnames → node-N)
+schema/types.ts              TypeScript contract for a UI
 scripts/kb-guard.py          the destructive-ingest guard  ← read this one
 engine/model_kb.py           CLI: search / get / serving / load
 engine/model-kb-mcp.py       MCP server — 6 tools
 engine/pipeline.py           full rebuild in the SAFE order
-engine/build_bm25.py         index builder
-engine/ingest_*.py           six ingests, one per upstream source
-engine/join_enrichments.py   fold enrichments into records
-engine/optimization_transfer.py  carry tuning from one model to a similar one
-engine/verify_goldens.py     retrieval regression suite (golden-queries.yaml)
+engine/export_obsidian.py    records.jsonl → Obsidian notes
+engine/research-corpus.glob  which markdown ingest_research reads
+vault/                       Obsidian notebook (authored research/)
 skill/SKILL.md               the Claude Code skill
 ```
 
