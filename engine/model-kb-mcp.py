@@ -6,6 +6,7 @@ Tools:
   model_get      — full recipe + ServeRequest materialization
   model_serving  — live asmi /serve/status (never from KB)
   model_load     — load recipe via r1o guarded apply (or dry_run)
+  model_serve    — reap stale servers, pick best recipe, asmi /serve/load, reap leftovers
 
 Env:
   ASMI_URL  default http://127.0.0.1:9090
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -83,6 +85,113 @@ def _find(records: list[dict], recipe_id: str) -> dict | None:
     if not pool:
         return None
     return max(pool, key=_recipe_score)
+
+
+_DOT_VER = re.compile(r"(?<![\w.])(?:v)?(\d+\.\d+)(?![\w.])", re.I)
+
+
+def _query_versions(query: str) -> set[str]:
+    return {m.group(1) for m in _DOT_VER.finditer(query or "")}
+
+
+def _recipe_blob(rec: dict) -> str:
+    art = rec.get("artifact") or {}
+    return " ".join(
+        str(x)
+        for x in (
+            rec.get("recipe_id"),
+            rec.get("id"),
+            art.get("name"),
+            art.get("hf_id"),
+            art.get("path"),
+        )
+        if x
+    ).lower()
+
+
+def _versions_ok(query: str, rec: dict) -> bool:
+    need = _query_versions(query)
+    if not need:
+        return True
+    blob = _recipe_blob(rec)
+    return all(v in blob or f"v{v}" in blob for v in need)
+
+
+def _resolve_best(records: list[dict], query: str) -> dict | None:
+    """Best serve_recipe for a family name or recipe id. Dotted versions must match.
+
+    'DeepSeek 4.1' must not resolve to DeepSeek-V4-Flash.
+    """
+    q = (query or "").strip()
+    if not q:
+        return None
+    rec = _find(records, q)
+    if rec and rec.get("kind") in (None, "serve_recipe") and _versions_ok(q, rec):
+        return rec
+    lower = q.lower()
+    tokens = [t for t in re.split(r"[^a-z0-9.]+", lower) if len(t) > 1]
+    cands: list[dict] = []
+    for r in records:
+        if r.get("kind") not in (None, "serve_recipe"):
+            continue
+        if not _versions_ok(q, r):
+            continue
+        blob = _recipe_blob(r)
+        if lower in blob or (tokens and all(t in blob for t in tokens)):
+            cands.append(r)
+    if not cands:
+        return None
+    return max(cands, key=_recipe_score)
+
+
+def _expand_path(raw: str) -> Path:
+    s = str(raw or "")
+    if s.startswith("~/"):
+        return Path.home() / s[2:]
+    return Path(s).expanduser()
+
+
+def _reap_stale(*, keep_ports: set[int] | None = None) -> dict:
+    """Stop asmi servers that are bare / model-less. Leave ready serves on other ports."""
+    keep = keep_ports or set()
+    code, data = _http_json("GET", f"{ASMI_URL.rstrip('/')}/serve/status", timeout=5)
+    stopped: list[dict] = []
+    noted: list[dict] = []
+    if not isinstance(data, dict):
+        return {"http_status": code, "stopped": stopped, "noted": [{"error": str(data)[:200]}]}
+    for s in data.get("servers") or []:
+        port = s.get("port")
+        state = s.get("state")
+        model = s.get("model")
+        pid = s.get("pid")
+        row = {"port": port, "state": state, "pid": pid, "model": model}
+        if port in keep:
+            continue
+        if state in ("idle", None) and not pid:
+            continue
+        stale = state == "bare" or (not model and state not in ("starting", "ready"))
+        if stale and port:
+            sc, body = _http_json(
+                "POST",
+                f"{ASMI_URL.rstrip('/')}/serve/stop?port={port}",
+                timeout=20,
+            )
+            stopped.append({**row, "stop_http": sc, "stop": body})
+        else:
+            noted.append(row)
+    return {"http_status": code, "stopped": stopped, "noted": noted}
+
+
+def _health_chat(port: int) -> dict:
+    url = f"http://127.0.0.1:{int(port)}/v1/chat/completions"
+    body = {
+        "model": "local",
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 4,
+        "stream": False,
+    }
+    code, data = _http_json("POST", url, body, timeout=30)
+    return {"http_status": code, "ok": code in (200, 201), "body": data if isinstance(data, dict) else str(data)[:300]}
 
 
 def _http_json(method: str, url: str, body: dict | None = None, timeout: float = 120.0):
@@ -318,6 +427,82 @@ def model_load(recipe_id: str, dry_run: bool = True) -> dict:
         port = asmi_body.get("port")
         match = [s for s in (status.get("servers") or []) if s.get("port") == port]
         out["port_status"] = match[0] if match else None
+    return out
+
+
+@mcp.tool()
+def model_serve(query: str, dry_run: bool = False) -> dict:
+    """Pick the best recipe for `query`, reap stale/bare servers, load via asmi.
+
+    One-shot serve. Query can be a family name ('DeepSeek 4.1') or a recipe_id.
+    Dotted versions must match — '4.1' will not load V4-Flash.
+    dry_run=True materializes + reaps report only (no load).
+    CHANGES CLUSTER STATE when dry_run is false.
+    """
+    records = load_records(RECORDS)
+    rec = _resolve_best(records, query)
+    if not rec:
+        return {
+            "ok": False,
+            "error": f"no serve_recipe matching {query!r}",
+            "kind": "missing_recipe_or_weights",
+            "hint": "A research note is not a config. Add weights + a serve-config, then ingest.",
+        }
+
+    backend = (rec.get("serve") or {}).get("backend") or "single"
+    if backend not in ("single", "jaccl"):
+        backend = "single"
+    hostfile = str(Path.home() / ".r1o" / "hostfiles" / "default.json") if backend == "jaccl" else None
+    try:
+        body = recipe_to_serve_request(rec, hostfile=hostfile if backend == "jaccl" else None)
+    except ValueError as e:
+        return {"ok": False, "error": str(e), "recipe_id": rec.get("recipe_id")}
+
+    mp = str(body.get("model_path") or "")
+    expanded = _expand_path(mp)
+    port = body.get("port")
+    before = _reap_stale(keep_ports={int(port)} if port else set())
+
+    out: dict = {
+        "recipe_id": rec.get("recipe_id"),
+        "query": query,
+        "score": _recipe_score(rec),
+        "asmi_body": {k: v for k, v in body.items() if k != "recipe_id"},
+        "model_path_exists": expanded.exists(),
+        "model_path_resolved": str(expanded),
+        "reap_before": before,
+        "via": "dry-run" if dry_run else "asmi-serve-load",
+    }
+
+    if not expanded.exists():
+        out["ok"] = False
+        out["kind"] = "missing_weights"
+        out["error"] = f"weights not on disk: {expanded}"
+        return out
+
+    if dry_run:
+        out["ok"] = True
+        out["note"] = "dry-run — reaped stale, did not load"
+        return out
+
+    code, data = _http_json(
+        "POST",
+        f"{ASMI_URL.rstrip('/')}/serve/load",
+        out["asmi_body"],
+        timeout=180,
+    )
+    out["load_http"] = code
+    out["load"] = data
+    keep = {int(port)} if port else set()
+    out["reap_after"] = _reap_stale(keep_ports=keep)
+    if port:
+        out["health"] = _health_chat(int(port))
+        sc, status = _http_json("GET", f"{ASMI_URL.rstrip('/')}/serve/status", timeout=5)
+        out["serve_status_http"] = sc
+        if isinstance(status, dict):
+            match = [s for s in (status.get("servers") or []) if s.get("port") == port]
+            out["port_status"] = match[0] if match else None
+    out["ok"] = code in (200, 201)
     return out
 
 
