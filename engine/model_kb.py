@@ -196,7 +196,7 @@ def cmd_load(args: argparse.Namespace) -> int:
         expanded = Path.home() / mp[2:] if mp.startswith("~/") else Path(mp).expanduser()
         result["model_path_exists"] = expanded.exists()
         result["model_path_resolved"] = str(expanded)
-        result["guarded_apply_url"] = f"{R1O_URL}/api/hermes/serve-configs/{recipe_name}/apply"
+        result["guarded_apply_url"] = f"{R1O_URL}/api/agent/serve-configs/{recipe_name}/apply"
         result["ok"] = True
         result["note"] = "dry-run only — no load call"
         print(json.dumps(result, indent=2, default=str))
@@ -213,7 +213,7 @@ def cmd_load(args: argparse.Namespace) -> int:
         result["asmi"] = data
         result["ok"] = code in (200, 201)
     else:
-        url = f"{R1O_URL.rstrip('/')}/api/hermes/serve-configs/{recipe_name}/apply"
+        url = f"{R1O_URL.rstrip('/')}/api/agent/serve-configs/{recipe_name}/apply"
         result["apply_url"] = url
         # Optional port override still goes through guardedServeLoad.
         apply_payload: dict = {}

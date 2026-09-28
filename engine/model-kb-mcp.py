@@ -375,7 +375,7 @@ def model_load(recipe_id: str, dry_run: bool = True) -> dict:
     """Load a recipe via r1o guarded apply route (guardedServeLoad).
 
     dry_run=True (default) only materializes + checks model_path exists.
-    dry_run=False POSTs /api/hermes/serve-configs/{name}/apply.
+    dry_run=False POSTs /api/agent/serve-configs/{name}/apply.
     """
     records = load_records(RECORDS)
     rec = _find(records, recipe_id)
@@ -404,7 +404,7 @@ def model_load(recipe_id: str, dry_run: bool = True) -> dict:
         "model_path_exists": expanded.exists(),
         "model_path_resolved": str(expanded),
         "via": "dry-run" if dry_run else "r1o-guarded-apply",
-        "apply_url": f"{R1O_URL.rstrip('/')}/api/hermes/serve-configs/{name}/apply",
+        "apply_url": f"{R1O_URL.rstrip('/')}/api/agent/serve-configs/{name}/apply",
     }
 
     if dry_run:
