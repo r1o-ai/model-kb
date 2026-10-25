@@ -66,8 +66,8 @@ class HybridModelKb:
             return None
         try:
             if self._server is None:
-                sys.path.insert(0, str(Path.home() / ".claude" / "local-marketplace" / "qwen-bm25-hybrid" / "lib"))
-                from qwen_embeddings import discover_embed_server
+                # Raises EmbedServerUnavailable (caught below) — no localhost guess.
+                from lib.embed_discovery import discover_embed_server
                 self._server = discover_embed_server()
             import requests
             resp = requests.post(

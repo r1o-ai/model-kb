@@ -18,15 +18,18 @@ from pathlib import Path
 import numpy as np
 import requests
 
-sys.path.insert(0, str(Path.home() / ".claude" / "local-marketplace" / "qwen-bm25-hybrid" / "lib"))
-from qwen_embeddings import discover_embed_server  # noqa: E402
-
-BATCH = 8
 # The engine's own directory, as pipeline.py resolves it. The engine moved from
 # ~/infra/model-kb to ~/.r1o/model-kb, and the old home-relative defaults
 # failed `pipeline.py --release` (FileNotFoundError on the dead path) inside the
 # desktop build:signed. Defaults follow the engine wherever it is installed.
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+from lib.embed_discovery import EmbedServerUnavailable, discover_embed_server  # noqa: E402
+
+BATCH = 8
+# Exit code when no embedding server proves itself: nothing was written, the
+# previous (vectors, ids, meta) generation is untouched.
+EXIT_NO_SERVER = 2
 
 
 def narrative_of(rec: dict) -> str:
@@ -44,10 +47,22 @@ def main() -> int:
     ap.add_argument("--records", default=str(ROOT / "records.jsonl"))
     ap.add_argument("--out", default=str(ROOT / "bm25_index" / "vectors.npy"))
     ap.add_argument("--dims", type=int, default=256)
+    ap.add_argument("--check", action="store_true", help="Discover the embed server, print it, write nothing")
     args = ap.parse_args()
 
-    server = discover_embed_server()
-    recs = [json.loads(line) for line in open(args.records)]
+    trace: list[str] = []
+    try:
+        server = discover_embed_server(trace=trace)
+    except EmbedServerUnavailable as e:
+        print(f"FAIL: embed server unavailable — vectors NOT rebuilt: {e}", file=sys.stderr)
+        return EXIT_NO_SERVER
+    if args.check:
+        print(server)
+        return 0
+    # Read the records once: the vectors, the id map and the sha all describe
+    # exactly these bytes, even if another writer replaces the file meanwhile.
+    records_bytes = Path(args.records).read_bytes()
+    recs = [json.loads(line) for line in records_bytes.decode().splitlines() if line.strip()]
     ids = [str(r.get("id") or r.get("recipe_id") or i) for i, r in enumerate(recs)]
     texts = [narrative_of(r) for r in recs]
     print(f"[embed] {len(texts)} records @ {server} dims={args.dims}", file=sys.stderr)
@@ -95,13 +110,18 @@ def main() -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     import hashlib
-    records_bytes = Path(args.records).read_bytes()
     records_sha = hashlib.sha256(records_bytes).hexdigest()
+    if hashlib.sha256(Path(args.records).read_bytes()).hexdigest() != records_sha:
+        print("FAIL: records.jsonl changed while embedding — vectors NOT written; re-run", file=sys.stderr)
+        return 1
     np.save(out.with_suffix(".tmp.npy"), vecs)
     (out.parent / "vectors.ids.tmp.json").write_text(json.dumps(ids))
-    (out.parent / "vectors.meta.json").write_text(json.dumps({"records_sha256": records_sha}))
+    (out.parent / "vectors.meta.tmp.json").write_text(
+        json.dumps({"records_sha256": records_sha, "rows": len(ids), "dims": args.dims, "server": server})
+    )
     out.with_suffix(".tmp.npy").rename(out)
     (out.parent / "vectors.ids.tmp.json").rename(out.parent / "vectors.ids.json")
+    (out.parent / "vectors.meta.tmp.json").rename(out.parent / "vectors.meta.json")
     print(f"[done] {vecs.shape} → {out}", file=sys.stderr)
     return 0
 
