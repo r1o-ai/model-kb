@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """verify.py — post-ingest health gate for model-kb.
 
-Fails closed if a kind is zeroed (join trap), engines are unknown, embeddings
-are misaligned, or recipe_gap reports missing_recipe.
+Fails closed if a kind is zeroed (join trap), a recipe has no engine or was not
+folded (no computed servability), embeddings are misaligned, or recipe_gap
+reports missing_recipe. A recipe whose engine no online node declares is NOT a
+failure: the fold marks it servable=false with a reason, and it is listed here.
 
 Usage:
   python3 verify.py
@@ -13,29 +15,26 @@ from __future__ import annotations
 import argparse
 import collections
 import json
-import os
-import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-R1O_ROOT = Path(os.environ.get("R1O_ROOT", Path.home() / "Projects" / "r1o"))
-ENGINE_TS = R1O_ROOT / "web" / "src" / "lib" / "engine-config.ts"
 
 
 def load_records(path: Path) -> list[dict]:
     return [json.loads(l) for l in path.open() if l.strip()]
 
 
-def known_engines() -> set[str]:
-    """Live SoT: r1o EngineId union. Empty file → fail closed."""
-    if not ENGINE_TS.exists():
-        raise SystemExit(f"FAIL: engine registry missing at {ENGINE_TS}")
-    text = ENGINE_TS.read_text()
-    ids = set(re.findall(r"^\s+\| '([a-z][a-z0-9_]*)'", text, re.M))
-    if not ids:
-        raise SystemExit(f"FAIL: parsed 0 EngineId values from {ENGINE_TS}")
-    return ids
+RECIPE_KINDS = ("serve_recipe", "authored_recipe")
+
+
+def unfolded_recipes(recs: list[dict]) -> list[str]:
+    """Recipe rows without computed servability — the fold step did not run on them."""
+    return [
+        str(r.get("recipe_id") or r.get("id"))
+        for r in recs
+        if r.get("kind") in RECIPE_KINDS and "servable" not in r
+    ]
 
 
 def verify(
@@ -65,19 +64,23 @@ def verify(
         f"  explicit model path:     {sum(1 for r in recipes if (r.get('artifact') or {}).get('path'))}"
     )
 
-    engines = known_engines()
-    bad = [
-        (r.get("recipe_id"), (r.get("serve") or {}).get("engine"))
-        for r in recipes
-        if (r.get("serve") or {}).get("engine") not in engines
-    ]
-    if bad:
-        print("FAIL: UNKNOWN ENGINES (advisor cannot build a command):", bad)
-        return 1
     missing = [r.get("recipe_id") for r in recipes if not (r.get("serve") or {}).get("engine")]
     if missing:
         print("FAIL: ENGINE-LESS recipes:", missing)
         return 1
+    unfolded = unfolded_recipes(recs)
+    if unfolded:
+        print("FAIL: recipes without servability (fold did not run):", unfolded[:12])
+        return 1
+    not_servable = [
+        (r.get("recipe_id") or r.get("id"), r.get("servable_reason"))
+        for r in recs
+        if r.get("kind") in RECIPE_KINDS and r.get("servable") is False
+    ]
+    print(f"servable: {sum(1 for r in recs if r.get('kind') in RECIPE_KINDS and r.get('servable'))}"
+          f"  not servable: {len(not_servable)}")
+    for rid, why in not_servable:
+        print(f"  NOT SERVABLE {rid}: {why}")
     print("engines: ok")
 
     if not skip_gaps:

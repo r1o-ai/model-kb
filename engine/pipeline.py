@@ -5,13 +5,13 @@ Order is load-bearing (ingest_serve_configs.py clobbers records.jsonl):
 
   lock → embed preflight → snapshot → backup → fill-paths → recipes → cloud
   → research → family → derivative → hf cards → merge enrichments → join
-  → transfer → BM25 → embed → verify
+  → transfer → fold authored recipes → BM25 → embed → verify
 
 Usage:
   python3 pipeline.py                 # full, fail closed
   python3 pipeline.py --release       # same + fatal network + seed export
   python3 pipeline.py --allow-partial # network failures become warnings (embed never does)
-  python3 pipeline.py --research-only # research → merge → join → BM25 → embed → verify (no recipes clobber)
+  python3 pipeline.py --research-only # research → merge → join → fold → BM25 → embed → verify (no recipes clobber)
   python3 pipeline.py --skip-embed --skip-fill-paths
 
 Records and vectors are one generation. records.jsonl rows must equal
@@ -28,19 +28,21 @@ from __future__ import annotations
 
 import argparse
 import collections
-import fcntl
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 PY = sys.executable
+sys.path.insert(0, str(ROOT))
+
+from lib.ingest_lock import EXIT_LOCKED, acquire_lock as _acquire_lock  # noqa: E402
+from recipe_store import EXIT_NO_ENGINES, EngineCatalogUnavailable, fold_into_records  # noqa: E402
 
 
 def run(script: str, *args: str, required: bool = True) -> bool:
@@ -110,33 +112,12 @@ def merge_enrichments() -> int:
 GENERATION = ("records.jsonl", "bm25_index/index.pkl", "bm25_index/vectors.npy",
               "bm25_index/vectors.ids.json", "bm25_index/vectors.meta.json")
 EXIT_NO_EMBED = 3
-EXIT_LOCKED = 75  # EX_TEMPFAIL
+# EXIT_LOCKED (75) and EXIT_NO_ENGINES (4) come from lib.ingest_lock / recipe_store.
 
 
 def acquire_lock(timeout_s: float):
-    """Exclusive ingest lock; waits up to timeout_s for the other writer."""
-    fh = open(ROOT / ".ingest.lock", "a+")
-    deadline = time.monotonic() + timeout_s
-    announced = False
-    while True:
-        try:
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            fh.seek(0)
-            fh.truncate()
-            fh.write(f"{os.getpid()} {datetime.now(timezone.utc).isoformat()}\n")
-            fh.flush()
-            return fh
-        except BlockingIOError:
-            if time.monotonic() >= deadline:
-                fh.seek(0)
-                holder = fh.read().strip() or "?"
-                fh.close()
-                return holder
-            if not announced:
-                fh.seek(0)
-                print(f"waiting for ingest lock (held by {fh.read().strip() or '?'})", flush=True)
-                announced = True
-            time.sleep(5)
+    """Exclusive ingest lock (shared with recipe_store put); waits up to timeout_s."""
+    return _acquire_lock(ROOT, timeout_s, who="pipeline")
 
 
 def snapshot_generation() -> Path:
@@ -250,6 +231,17 @@ def main() -> int:
             )
 
         run("enrich_optimization_transfer.py", "--recipes", str(records), required=False)
+
+        # Authored recipes (recipes.jsonl, the only hand-made data) re-enter every
+        # generation here, after every step that rewrites rows, and every recipe
+        # row gets servable/servable_on from the live engine union. No union →
+        # abort; the previous generation is restored below.
+        print("+ fold authored recipes + servability", flush=True)
+        try:
+            print("fold:", fold_into_records(ROOT, records), flush=True)
+        except EngineCatalogUnavailable as e:
+            print(f"FAIL: no live engine catalog from asmi — fold aborted, nothing kept ({e})", flush=True)
+            return EXIT_NO_ENGINES
 
         if not args.skip_index:
             run("build_bm25.py", "--rebuild")

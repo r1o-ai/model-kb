@@ -7,6 +7,7 @@ Tools:
   model_serving  — live asmi /serve/status (never from KB)
   model_load     — load recipe via r1o guarded apply (or dry_run)
   model_serve    — reap stale servers, pick best recipe, asmi /serve/load, reap leftovers
+  model_recipe_put — write a (model, engine, source) recipe record (writer node only)
 
 Env:
   ASMI_URL  default http://127.0.0.1:9090
@@ -566,6 +567,32 @@ def model_serve(query: str, dry_run: bool = False) -> dict:
             out["port_status"] = match[0] if match else None
     out["ok"] = code in (200, 201)
     return out
+
+
+@mcp.tool()
+def model_recipe_put(model: str, engine: str, source: str, patch: dict) -> dict:
+    """Write one recipe record — the only write path for hand-made recipe data.
+
+    Keyed (model, engine, source); source is research | benchmark | user (a user
+    override wins over benchmark, which wins over research). `patch` deep-merges
+    into the record's recipe; a null value deletes that key. Every call appends to
+    the record's history[], rewrites ~/.r1o/model-kb/recipes.jsonl atomically and
+    re-exports the read-only recipes.snapshot.json the chat path reads.
+
+    Only the node whose crontab runs the model-kb pipeline may write. When an
+    ingest holds the lock, nothing is written and the result says retry.
+    """
+    import recipe_store  # noqa: PLC0415 — keeps search tools importable without it
+
+    try:
+        rec = recipe_store.put(ROOT, model=model, engine=engine, source=source, patch=patch)
+    except recipe_store.LockHeld as e:
+        return {"ok": False, "retry": True, "exit_code": recipe_store.EXIT_LOCKED, "error": str(e)}
+    except recipe_store.NotWriterNode as e:
+        return {"ok": False, "retry": False, "exit_code": recipe_store.EXIT_NOT_WRITER, "error": str(e)}
+    except recipe_store.RecipeError as e:
+        return {"ok": False, "retry": False, "error": str(e)}
+    return {"ok": True, "record": rec, "snapshot": str(ROOT / recipe_store.SNAPSHOT)}
 
 
 if __name__ == "__main__":

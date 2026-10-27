@@ -64,10 +64,11 @@ def _handler(engines: tuple[str, ...], cluster: list[dict] | None):
             body = json.loads(self.rfile.read(n) or b"{}")
             if self.path != "/v1/embeddings":
                 return self._json(404, {})
+            dims = int(body.get("dimensions") or DIMS)
             data = []
             for text in body.get("input") or []:
                 h = hashlib.sha256(text.encode()).digest()
-                data.append({"embedding": [b / 255.0 + 0.01 for b in h[:DIMS]]})
+                data.append({"embedding": [h[i % len(h)] / 255.0 + 0.01 for i in range(dims)]})
             self._json(200, {"data": data})
 
     return Stub
