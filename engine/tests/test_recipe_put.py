@@ -305,6 +305,16 @@ class TestPut(KbCase):
             with self.assertRaises(self.rs.RecipeError):
                 self.rs.put(self.kb, model=model, engine=engine, source="user", patch={})
 
+    def test_each_replaced_version_is_backed_up_once(self):
+        self.rs.put(self.kb, model="m", engine="fx_engine", source="user", patch={"a": 1})
+        v1 = (self.kb / "recipes.jsonl").read_bytes()
+        self.rs.put(self.kb, model="m", engine="fx_engine", source="user", patch={"a": 2})
+        self.rs.backup_store(self.kb)  # current version
+        self.rs.backup_store(self.kb)  # same content again: no new file
+        backups = sorted((self.kb / "backups" / "recipes").iterdir())
+        self.assertEqual(len(backups), 2)
+        self.assertIn(v1, [b.read_bytes() for b in backups])
+
     def test_write_is_atomic_temp_plus_replace(self):
         self.rs.put(self.kb, model="m", engine="fx_engine", source="user", patch={"a": 1})
         leftovers = [p.name for p in self.kb.iterdir() if ".tmp" in p.name or p.name.startswith("recipes.jsonl.")]
