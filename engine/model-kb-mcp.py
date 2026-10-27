@@ -141,7 +141,21 @@ def _resolve_best(records: list[dict], query: str) -> dict | None:
             cands.append(r)
     if not cands:
         return None
-    return max(cands, key=_recipe_score)
+    # Benchmarks rank recipes, but a recipe whose weights are gone cannot serve.
+    # Check the disk at decision time; fall back to the full set only when no
+    # candidate is present (the caller then reports missing_weights).
+    present = [r for r in cands if _weights_present(r)]
+    return max(present or cands, key=_recipe_score)
+
+
+def _weights_present(rec: dict) -> bool:
+    """True when the recipe's materialized model_path exists on this node."""
+    try:
+        body = recipe_to_serve_request(rec)
+    except ValueError:
+        return False
+    mp = str(body.get("model_path") or "")
+    return bool(mp) and _expand_path(mp).exists()
 
 
 def _expand_path(raw: str) -> Path:
@@ -151,8 +165,11 @@ def _expand_path(raw: str) -> Path:
     return Path(s).expanduser()
 
 
-def _reap_stale(*, keep_ports: set[int] | None = None) -> dict:
-    """Stop asmi servers that are bare / model-less. Leave ready serves on other ports."""
+def _reap_stale(*, keep_ports: set[int] | None = None, dry_run: bool = False) -> dict:
+    """Stop asmi servers that are bare / model-less. Leave ready serves on other ports.
+
+    dry_run=True reports what would be stopped without stopping anything.
+    """
     keep = keep_ports or set()
     code, data = _http_json("GET", f"{ASMI_URL.rstrip('/')}/serve/status", timeout=5)
     stopped: list[dict] = []
@@ -167,10 +184,13 @@ def _reap_stale(*, keep_ports: set[int] | None = None) -> dict:
         row = {"port": port, "state": state, "pid": pid, "model": model}
         if port in keep:
             continue
+        # Empty idle slot is not a process.
         if state in ("idle", None) and not pid:
             continue
         stale = state == "bare" or (not model and state not in ("starting", "ready"))
-        if stale and port:
+        if stale and port and dry_run:
+            stopped.append({**row, "would_stop": True})
+        elif stale and port:
             sc, body = _http_json(
                 "POST",
                 f"{ASMI_URL.rstrip('/')}/serve/stop?port={port}",
@@ -220,13 +240,26 @@ def _http_json(method: str, url: str, body: dict | None = None, timeout: float =
 
 
 @mcp.tool()
-def model_search(query: str, top_k: int = 8) -> dict:
-    """BM25 search over serve recipes (quant, accelerators, engine, model names)."""
+def model_search(query: str, top_k: int = 8, hybrid: bool = True) -> dict:
+    """Search recipes + research notes (quant, accelerators, engine, model names).
+
+    hybrid=True (default): RRF-fuse BM25 with Qwen3-VL embedding ranks when
+    bm25_index/vectors.npy exists (run embed_model_kb.py after ingests).
+    Falls back to BM25-only with a `note` if vectors/server unavailable.
+    """
     if not INDEX.exists() or not RECORDS.exists():
         return {"error": "index missing — run ingest_serve_configs.py && build_bm25.py --rebuild"}
+    if hybrid:
+        try:
+            from hybrid_search import HybridModelKb
+            hits = HybridModelKb(INDEX).search(query, top_k=top_k)
+            return {"query": query, "mode": "hybrid-rrf", "hits": hits}
+        except Exception as e:  # noqa: BLE001 — search must never die on the fancy path
+            idx = load_index(INDEX)
+            return {"query": query, "mode": "bm25-fallback", "note": str(e), "hits": bm25_search(idx, query, top_k=top_k)}
     idx = load_index(INDEX)
     hits = bm25_search(idx, query, top_k=top_k)
-    return {"query": query, "hits": hits}
+    return {"query": query, "mode": "bm25", "hits": hits}
 
 
 @mcp.tool()
@@ -259,6 +292,8 @@ def model_get(recipe_id: str) -> dict:
         "enrichment_links": rec.get("enrichment_links"),
         "serve_request": body,
         "asmi_body": {k: v for k, v in body.items() if k != "recipe_id"},
+        # Live disk check on this node, not a KB field — weights come and go.
+        "weights_present": _weights_present(rec),
         "source": "model-kb",
     }
 
@@ -343,10 +378,35 @@ def model_family(hf_id: str = "", recipe_id: str = "") -> dict:
             if r.get("kind") == "hf_family":
                 root = (r.get("measurements") or {}).get("root_base") or ""
                 if hf_id and (hf_id == root or hf_id in root or root in hf_id):
+                    deriv = next(
+                        (
+                            d
+                            for d in records
+                            if d.get("kind") == "hf_derivative"
+                            and (d.get("measurements") or {}).get("root_base") == root
+                        ),
+                        None,
+                    )
+                    dmeas = (deriv or {}).get("measurements") or {}
+                    summary = {
+                        k: dmeas.get(k)
+                        for k in (
+                            "root_base",
+                            "official_status",
+                            "discovered",
+                            "truncated",
+                            "audited",
+                            "relation_counts",
+                            "component_drop_ids",
+                            "gated_unauthenticated",
+                        )
+                    }
                     return {
                         "root_base": root,
                         "family": (r.get("measurements") or {}).get("family_levels"),
                         "recommend_serve": (r.get("measurements") or {}).get("recommend_serve"),
+                        "truncated": (r.get("measurements") or {}).get("truncated"),
+                        "hf_derivative": summary if deriv else None,
                         "source": "model-kb/hf_family",
                     }
         return {"error": "no recipe/family found", "hf_id": hf_id, "recipe_id": recipe_id}
@@ -356,9 +416,10 @@ def model_family(hf_id: str = "", recipe_id: str = "") -> dict:
         "recipe_id": rec.get("recipe_id"),
         "artifact": rec.get("artifact"),
         "hf_family": fam,
+        "hf_derivative": rec.get("hf_derivative"),
         "community_quality": rec.get("community_quality"),
         "enrichment_links": rec.get("enrichment_links"),
-        "hint": "Use recommend_serve / mlx / gguf_unsloth levels to pick a quant; local benchmarks[] for tok/s.",
+        "hint": "recommend_serve is popularity per format level, not an engine. hf_derivative lists component drops and gated ids. local benchmarks[] for tok/s. Engine comes from the recipe plus engine-config.ts.",
         "source": "model-kb",
     }
 
@@ -375,7 +436,7 @@ def model_load(recipe_id: str, dry_run: bool = True) -> dict:
     """Load a recipe via r1o guarded apply route (guardedServeLoad).
 
     dry_run=True (default) only materializes + checks model_path exists.
-    dry_run=False POSTs /api/agent/serve-configs/{name}/apply.
+    dry_run=False POSTs /api/hermes/serve-configs/{name}/apply.
     """
     records = load_records(RECORDS)
     rec = _find(records, recipe_id)
@@ -404,7 +465,7 @@ def model_load(recipe_id: str, dry_run: bool = True) -> dict:
         "model_path_exists": expanded.exists(),
         "model_path_resolved": str(expanded),
         "via": "dry-run" if dry_run else "r1o-guarded-apply",
-        "apply_url": f"{R1O_URL.rstrip('/')}/api/agent/serve-configs/{name}/apply",
+        "apply_url": f"{R1O_URL.rstrip('/')}/api/hermes/serve-configs/{name}/apply",
     }
 
     if dry_run:
@@ -437,7 +498,8 @@ def model_serve(query: str, dry_run: bool = False) -> dict:
     One-shot serve. Query can be a family name ('DeepSeek 4.1') or a recipe_id.
     Dotted versions must match — '4.1' will not load V4-Flash.
     dry_run=True materializes + reaps report only (no load).
-    CHANGES CLUSTER STATE when dry_run is false.
+    CHANGES CLUSTER STATE when dry_run is false: stops bare servers, POSTs /serve/load.
+    After load, stops leftover bare servers except the new port.
     """
     records = load_records(RECORDS)
     rec = _resolve_best(records, query)
@@ -461,7 +523,7 @@ def model_serve(query: str, dry_run: bool = False) -> dict:
     mp = str(body.get("model_path") or "")
     expanded = _expand_path(mp)
     port = body.get("port")
-    before = _reap_stale(keep_ports={int(port)} if port else set())
+    before = _reap_stale(keep_ports={int(port)} if port else set(), dry_run=dry_run)
 
     out: dict = {
         "recipe_id": rec.get("recipe_id"),
@@ -482,7 +544,7 @@ def model_serve(query: str, dry_run: bool = False) -> dict:
 
     if dry_run:
         out["ok"] = True
-        out["note"] = "dry-run — reaped stale, did not load"
+        out["note"] = "dry-run — reported stale servers, stopped nothing, did not load"
         return out
 
     code, data = _http_json(

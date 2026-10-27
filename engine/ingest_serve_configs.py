@@ -41,6 +41,7 @@ _QUANT_MAP = [
     (re.compile(r"\bmixed\b", re.I), "mixed"),
     (re.compile(r"\bbf16\b", re.I), "bf16"),
     (re.compile(r"\bfp16\b|\bf16\b", re.I), "fp16"),
+    (re.compile(r"\bfp8\b|fp8[-\w]*", re.I), "fp8"),
     # integer bits — (?<!\d) blocks the "6" inside "3.6bit"
     (re.compile(r"(?<!\d)4-?bit\b|\bq4\b|\bmlx-4bit\b|\bint4\b", re.I), "4bit"),
     (re.compile(r"(?<!\d)8-?bit\b|\bq8\b|\bint8\b", re.I), "8bit"),
@@ -86,6 +87,8 @@ def build_search_text(rec: dict[str, Any]) -> str:
     tokens.extend(quant.get("aliases") or [])
     tokens.append(str(serve.get("engine") or ""))
     tokens.append(str(serve.get("backend") or ""))
+    tokens.append(str(serve.get("hardware") or ""))
+    tokens.append(str(serve.get("os") or ""))
     for a in accels:
         if not a.get("enabled", True):
             continue
@@ -231,7 +234,9 @@ def recipe_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
         },
         "quant": quant,
         "serve": {
-            "engine": serve.get("engine") or "mlx_lm",
+            "engine": serve.get("engine") or None,
+            "hardware": serve.get("hardware") or None,
+            "os": serve.get("os") or None,
             "backend": backend,
             "port": serve.get("port"),
             "decode_concurrency": serve.get("decode_concurrency") or 1,
@@ -305,7 +310,7 @@ def recipe_to_serve_request(rec: dict[str, Any], hostfile: str | None = None) ->
 
     body: dict[str, Any] = {
         "model_path": model_path,
-        "engine": serve.get("engine") or "mlx_lm",
+        "engine": serve.get("engine") or None,
         "backend": backend,
         "port": serve.get("port"),
         "decode_concurrency": serve.get("decode_concurrency") or 1,

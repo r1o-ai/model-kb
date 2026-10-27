@@ -35,6 +35,7 @@ _ACCEL_HINTS = {
     "mtp": "mtp",
     "mtplx": "mtplx",
     "triattention": "triattention",
+    "dspark": "dspark",
     "speculative": "dflash",
 }
 _ENGINE_HINTS = {
@@ -45,15 +46,36 @@ _ENGINE_HINTS = {
     "dflash-mlx": "dflash-mlx",
     "ds4": "ds4",
     "mtplx": "mtplx",
+    "vllm_cuda": "vllm_cuda",
+    "vllm-cuda": "vllm_cuda",
+    "vllm": "vllm_cuda",
+    "sglang": "sglang",
+    "llama.cpp": "llama_cpp",
+    "llama_cpp": "llama_cpp",
 }
 _MODEL_GLOBS = [
-    (re.compile(r"qwen3\.?6.*35b|qwen3\.6-35b|35b-a3b", re.I), "*Qwen3.6*35B*A3B*"),
+    # Meta Muse — before generic gemma/minimax noise; Glimmer is the local 30B line
+    (re.compile(r"muse.?glimmer|muse-glimmer-30b", re.I), "*Muse*Glimmer*30B*"),
+    (re.compile(r"muse.?spark|muse-spark", re.I), "*Muse*Spark*"),
+    # NVIDIA Nemotron 3.5 Lightning / Nano
+    (re.compile(r"nemotron.?3\.?5.?lightning|lightning.?30b.?a3b", re.I), "*Nemotron*Lightning*"),
+    (re.compile(r"nemotron.?3.?nano|nemotron.?nano.?30b", re.I), "*Nemotron*Nano*"),
+    (re.compile(r"nemotron", re.I), "*Nemotron*"),
+    # Qwen — 3.8 before 3.6/3.5; avoid bare 35b-a3b matching Muse notes that only mention Qwen in "see also"
+    (re.compile(r"qwen3\.?8|2\.4t.?a95b|qwen3\.8-max", re.I), "*Qwen3.8*"),
+    (re.compile(r"qwen3\.?6.*35b|qwen3\.6-35b", re.I), "*Qwen3.6*35B*A3B*"),
     (re.compile(r"qwen3\.?6.*27b|qwen3\.6-27b", re.I), "*Qwen3.6*27B*"),
     (re.compile(r"qwen3\.?5.*35b|qwen3\.5-35b", re.I), "*Qwen3.5*35B*A3B*"),
     (re.compile(r"qwen3\.?5.*27b|qwen3\.5-27b", re.I), "*Qwen3.5*27B*"),
     (re.compile(r"qwen3\.?5.*a3b|qwen3\.5-a3b", re.I), "*Qwen3.5*A3B*"),
     (re.compile(r"minimax", re.I), "*MiniMax*"),
     (re.compile(r"kimi", re.I), "*Kimi*"),
+    # GLM — Flash before generic 5.x so 5.3-Flash notes don't collapse onto 5.2/5.1
+    (re.compile(r"glm.?5\.?3.?flash|glm-5\.3-flash|glm53.?flash", re.I), "*GLM-5.3-Flash*"),
+    (re.compile(r"glm.?5\.?3", re.I), "*GLM-5.3*"),
+    (re.compile(r"glm.?5\.?2", re.I), "*GLM-5.2*"),
+    (re.compile(r"glm.?5\.?1", re.I), "*GLM-5.1*"),
+    (re.compile(r"\bglm\b", re.I), "*GLM*"),
     # DeepSeek family — prefer Flash/Pro-specific globs before generic
     (re.compile(r"deepseek.?v4.?flash|ds4.?flash|ds4-gguf|v4-flash", re.I), "*DeepSeek*Flash*"),
     (re.compile(r"deepseek.?v4.?pro|v4-pro", re.I), "*DeepSeek*Pro*"),
@@ -78,16 +100,11 @@ def expand_corpus(glob_file: Path) -> list[Path]:
         # graph-indexer py is not a research note — skip for note parse
         if line.endswith("param_researcher.py"):
             continue
-        if line.startswith("/"):
-            patterns = [line]
-        else:
-            # Repo-relative first (this kit's vault/), then $HOME (wiki/atlas/…).
-            patterns = [str(ROOT.parent / line), str(HOME / line)]
-        for pattern in patterns:
-            for m in globmod.glob(pattern):
-                p = Path(m)
-                if p.is_file() and p.suffix.lower() in {".md", ".markdown"}:
-                    hits.append(p)
+        pattern = str(HOME / line) if not line.startswith("/") else line
+        for m in globmod.glob(pattern):
+            p = Path(m)
+            if p.is_file() and p.suffix.lower() in {".md", ".markdown"}:
+                hits.append(p)
     # unique, stable
     return sorted(set(hits), key=lambda p: str(p))
 
@@ -308,7 +325,8 @@ def note_to_record(path: Path) -> dict[str, Any] | None:
     elif claims:
         conf = "narrative"
 
-    # BM25 tokens from title + applies + claim metrics (max ~40 claim tokens)
+    # BM25 tokens from title + applies + claim metrics + HF-style repo ids in body
+    # (backticks / bare org/name). Repo ids matter for "is X in model-kb?" queries.
     tokens: list[str] = [title.lower(), path.stem.replace("-", " ")]
     for g in applies.get("model_globs") or []:
         tokens.append(g.replace("*", " ").lower())
@@ -317,6 +335,15 @@ def note_to_record(path: Path) -> dict[str, Any] | None:
         tokens.append(f"accel:{a}")
     for e in applies.get("engines") or []:
         tokens.append(str(e))
+    # Capture `org/model-name` style ids from the note body (first 8k, max 12).
+    repo_ids = re.findall(
+        r"(?:`|^|\s)([A-Za-z0-9_.-]+/[A-Za-z0-9_./+-]{3,80})(?:`|\s|$)",
+        text[:8000],
+        flags=re.M,
+    )
+    for rid in repo_ids[:12]:
+        tokens.append(rid.lower())
+        tokens.append(rid.split("/")[-1].lower().replace("-", " "))
     claim_toks: list[str] = []
     for c in claims:
         m = c.get("metrics") or {}

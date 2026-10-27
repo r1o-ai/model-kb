@@ -118,7 +118,7 @@ def load_spec_overrides_ts(path: Path) -> dict[str, Any]:
     text = path.read_text()
     out: dict[str, Any] = {}
     for m in re.finditer(
-        r"'(?P<id>glm-[^']+)':\s*\{\s*contextWindow:\s*(?P<ctx>[\d_]+)\s*,\s*"
+        r"'(?P<id>(?:glm|grok)-[^']+)':\s*\{\s*contextWindow:\s*(?P<ctx>[\d_]+)\s*,\s*"
         r"maxOutputTokens:\s*(?P<max>[\d_]+)\s*,\s*vision:\s*(?P<vis>true|false)",
         text,
     ):
@@ -241,20 +241,29 @@ def merge_model_rows(
             }
 
     for mid, spec in overrides.items():
-        k = key("zai", mid)
+        prov = "xai" if str(mid).startswith("grok") else "zai"
+        k = key(prov, mid)
         row = by.get(k) or {
-            "provider": "zai",
+            "provider": prov,
             "model_id": mid,
             "short_name": mid,
             "sources": [],
             "options": {},
             "benchmarks": [],
             "quota": None,
-            "family": "zai",
+            "family": "xai" if prov == "xai" else "zai",
             "login_label": None,
         }
-        row["context_window"] = spec.get("contextWindow")
-        row["max_output_tokens"] = spec.get("maxOutputTokens")
+        # Prefer official curated when larger than a live operational cap.
+        def _prefer(prev, nxt):
+            try:
+                n = int(nxt) if nxt is not None else 0
+                p0 = int(prev) if prev is not None else 0
+                return n if n >= p0 else p0
+            except (TypeError, ValueError):
+                return nxt if nxt is not None else prev
+        row["context_window"] = _prefer(row.get("context_window"), spec.get("contextWindow"))
+        row["max_output_tokens"] = _prefer(row.get("max_output_tokens"), spec.get("maxOutputTokens"))
         row["vision"] = spec.get("vision")
         row["options"]["vision"] = spec.get("vision")
         row["sources"] = list(set(row.get("sources") or []) | {spec.get("source") or "override"})

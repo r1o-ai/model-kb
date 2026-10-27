@@ -54,7 +54,7 @@ def score_join(note: dict[str, Any], recipe: dict[str, Any]) -> int:
 
     # HF family tree: recipe is in the member set or shares base
     kind = note.get("kind") or ""
-    if kind in ("hf_family", "hf_card"):
+    if kind in ("hf_family", "hf_card", "hf_derivative"):
         members = set(applies.get("family_member_ids") or [])
         bases = set(applies.get("base_models") or applies.get("hf_ids") or [])
         if hf and hf in members:
@@ -214,6 +214,19 @@ def attach(note: dict[str, Any], recipe: dict[str, Any], score: int) -> None:
             "member_count": meas.get("member_count"),
             "levels": {k: len(v) if isinstance(v, list) else 0 for k, v in meas["family_levels"].items()},
             "recommend_serve": meas.get("recommend_serve") or [],
+            "truncated": bool(meas.get("truncated")),
+            "enrichment_id": eid,
+        }
+    if kind == "hf_derivative":
+        recipe["hf_derivative"] = {
+            "root_base": meas.get("root_base"),
+            "discovered": meas.get("discovered"),
+            "audited": meas.get("audited"),
+            "truncated": bool(meas.get("truncated")),
+            "relation_counts": meas.get("relation_counts") or {},
+            "component_drop_ids": meas.get("component_drop_ids") or [],
+            "gated_unauthenticated": meas.get("gated_unauthenticated") or [],
+            "official_status": meas.get("official_status"),
             "enrichment_id": eid,
         }
 

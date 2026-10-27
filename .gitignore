@@ -34,3 +34,11 @@ vault/attachments/
 
 # Seed IS shipped; the live corpus is not
 !data/records.seed.jsonl
+
+# Runtime corpus + authored recipe store live in ~/.r1o/model-kb, never here
+engine/enrichments*.jsonl
+engine/join_review.jsonl
+engine/recipes.jsonl
+engine/recipes.snapshot.json
+engine/.ingest.lock
+engine/model_kb.db

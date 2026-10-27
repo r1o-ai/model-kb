@@ -34,33 +34,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from lib.hf_hub import token_source
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_RECIPES = ROOT / "records.jsonl"
 DEFAULT_OUT = ROOT / "enrichments_hf.jsonl"
 HF_API = "https://huggingface.co/api/models"
 HF_RAW = "https://huggingface.co"
-
-# Quality metrics we care about for "which model to serve" ranking
-QUALITY_KEYS = {
-    "mmlu-pro",
-    "mmlu_pro",
-    "mmlu-redux",
-    "gpqa",
-    "gpqa diamond",
-    "swe-bench",
-    "swe-bench verified",
-    "livecodebench",
-    "ifeval",
-    "aa-lcr",
-    "hle",
-    "bfcl",
-    "tau2-bench",
-    "mmmu",
-    "mmmu-pro",
-    "aime",
-    "hmmt",
-}
-
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -206,13 +186,12 @@ def parse_html_quality_tables(readme: str) -> list[dict[str, Any]]:
             if not metric or _is_score(metric):
                 continue
             metric_l = metric.lower().strip()
-            # collect scores per column
+            # Every numeric cell. No metric allowlist — GSM8K / refusal / KL
+            # tables are whatever the card named. Cap is applied by the caller.
             for ci, cell in enumerate(row[1:], start=1):
                 if not _is_score(cell):
                     continue
                 model_col = header[ci] if ci < len(header) else f"col{ci}"
-                if not _metric_interesting(metric_l):
-                    continue
                 val = _parse_score(cell)
                 if val is None:
                     continue
@@ -247,32 +226,6 @@ def _parse_score(s: str) -> float | None:
         return float(s)
     except ValueError:
         return None
-
-
-def _metric_interesting(metric_l: str) -> bool:
-    if any(k in metric_l for k in QUALITY_KEYS):
-        return True
-    # broader useful buckets
-    for k in (
-        "mmlu",
-        "gpqa",
-        "swe",
-        "code",
-        "livecode",
-        "ifeval",
-        "bench",
-        "mmmu",
-        "aime",
-        "math",
-        "agent",
-        "browse",
-        "tau",
-        "bfcl",
-        "hle",
-    ):
-        if k in metric_l:
-            return True
-    return False
 
 
 def parse_quant_inventory(api: dict[str, Any], readme: str) -> list[dict[str, Any]]:
@@ -335,27 +288,36 @@ def parse_claims(readme: str) -> list[str]:
     return claims[:20]
 
 
-def pick_best_repo(cands: list[str]) -> tuple[str | None, dict, str]:
-    """Return (repo_id, api_json, readme) for first existing candidate; prefer unsloth GGUF."""
-    # Prefer unsloth *-GGUF then unsloth then original
-    ordered = sorted(
-        cands,
-        key=lambda r: (
-            0 if r.startswith("unsloth/") and r.endswith("-GGUF") else
-            1 if r.startswith("unsloth/") else
-            2
-        ),
-    )
-    for repo in ordered:
+def pick_best_repo(cands: list[str]) -> tuple[str | None, dict, str, str]:
+    """(repo, api, readme, access).
+
+    The first candidate is the artifact's own hf id. A 401/403 stops the walk —
+    another org's public card is not a substitute for a gated repo.
+    Later candidates are tried only when the first id is missing (404 / no id).
+    """
+    def one(repo: str) -> tuple[str, dict, str, str] | None:
         code, api = _http_json(f"{HF_API}/{repo}")
+        if code in (401, 403):
+            return repo, {}, "", "gated_unauthenticated"
         if code != 200 or not isinstance(api, dict) or not api.get("id"):
-            continue
-        # README
+            return None
         rc, readme = _http_get(f"{HF_RAW}/{repo}/raw/main/README.md")
-        if rc != 200:
-            readme = ""
-        return repo, api, readme
-    return None, {}, ""
+        if rc in (401, 403):
+            return repo, api if isinstance(api, dict) else {}, "", "gated_unauthenticated"
+        return repo, api, readme if rc == 200 else "", "ok"
+
+    if not cands:
+        return None, {}, "", "missing"
+    first = one(cands[0])
+    if first is not None and (first[3] == "ok" or first[3] == "gated_unauthenticated"):
+        return first
+    for repo in cands[1:]:
+        got = one(repo)
+        if got is not None and got[3] == "ok":
+            return got
+        if got is not None and got[3] == "gated_unauthenticated":
+            return got
+    return None, {}, "", "missing"
 
 
 def build_enrichment(
@@ -363,7 +325,31 @@ def build_enrichment(
     repo: str,
     api: dict[str, Any],
     readme: str,
+    access: str = "ok",
 ) -> dict[str, Any]:
+    if access != "ok":
+        eid = f"hfcard:{(repo or 'unknown').replace('/', '__')}"
+        return {
+            "id": eid,
+            "kind": "hf_card",
+            "enrichment_id": eid,
+            "title": f"HF card · {repo} ({access})",
+            "applies_to": {
+                "model_globs": [g for g in (artifact.get("hf_id"), artifact.get("name"), repo) if g],
+                "hf_ids": [artifact["hf_id"]] if artifact.get("hf_id") else [],
+                "base_models": [],
+                "accel_types": [],
+                "engines": [],
+            },
+            "claims": [],
+            "measurements": {"access": access, "token_source": token_source(), "quality": {}},
+            "confidence": "pointer",
+            "search_text": f"hf-card gated {repo}".lower(),
+            "search_narrative": f"Model card for {repo} was not read ({access}). No quality scores invented.",
+            "source": {"type": "huggingface", "repo": repo, "url": f"https://huggingface.co/{repo}"},
+            "sources_used": ["huggingface"],
+            "created": _now(),
+        }
     card = api.get("cardData") or {}
     base = card.get("base_model") or []
     if isinstance(base, str):
@@ -445,7 +431,7 @@ def build_enrichment(
             "hf_ids": [artifact["hf_id"]] if artifact.get("hf_id") else [],
             "base_models": base,
             "accel_types": [],
-            "engines": ["mlx_lm", "mlx_vlm", "ds4"],
+            "engines": [],
         },
         "claims": claims,
         "measurements": {
@@ -534,12 +520,19 @@ def main() -> int:
     with args.out.open("w") as fout:
         for art in arts:
             cands = resolve_unsloth_candidates(art.get("hf_id") or "", art.get("name") or "")
-            repo, api, readme = pick_best_repo(cands)
+            repo, api, readme, access = pick_best_repo(cands)
+            if access == "gated_unauthenticated" and repo:
+                rec = build_enrichment(art, repo, {}, "", access=access)
+                fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                written += 1
+                print(f"  gated unread: {repo} token_source={token_source()}")
+                time.sleep(args.sleep)
+                continue
             if not repo:
                 print(f"  skip (no card): {art.get('hf_id') or art.get('name')}")
                 time.sleep(args.sleep)
                 continue
-            rec = build_enrichment(art, repo, api, readme)
+            rec = build_enrichment(art, repo, api, readme, access="ok")
             fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
             written += 1
             qn = len(rec.get("measurements", {}).get("quality") or {})
@@ -551,8 +544,15 @@ def main() -> int:
     if args.join and written:
         # merge research + hf into enrichments.jsonl
         merged = ROOT / "enrichments.jsonl"
+        # Family + research + cards MUST merge together. join_enrichments.py
+        # drops standalone hf_family/hf_card rows; omitting family here zeros
+        # model_family()'s hf_id fallback (skill join-trap).
         n = merge_enrichment_files(
-            [ROOT / "enrichments.jsonl", args.out],
+            [
+                ROOT / "enrichments.jsonl",
+                ROOT / "enrichments_hf_family.jsonl",
+                args.out,
+            ],
             ROOT / "enrichments.merged.jsonl",
         )
         ROOT.joinpath("enrichments.merged.jsonl").replace(merged)
