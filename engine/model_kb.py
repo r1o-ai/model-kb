@@ -49,26 +49,38 @@ def cmd_search(args: argparse.Namespace) -> int:
     if not args.index.exists() or not args.records.exists():
         print("missing index/records — run: python3 ingest_serve_configs.py && python3 build_bm25.py --rebuild", file=sys.stderr)
         return 1
-    idx = load_index(args.index)
-    hits = bm25_search(idx, args.query, top_k=args.top_k)
+    hits = None
+    if getattr(args, "hybrid", False):
+        try:
+            from hybrid_search import HybridModelKb
+            hits = HybridModelKb(args.index).search(args.query, top_k=args.top_k)
+        except Exception as e:  # fail open to BM25 — search must never die on the fancy path
+            print(f"[hybrid] unavailable ({e}) — BM25 only", file=sys.stderr)
+            hits = None
+    if hits is None:
+        idx = load_index(args.index)
+        hits = bm25_search(idx, args.query, top_k=args.top_k)
     if args.json:
         print(json.dumps(hits, indent=2))
         return 0
     if not hits:
         print("no hits")
         return 1
-    for h in hits:
+    for rank_i, h in enumerate(hits, 1):
         acc = ",".join(h.get("accels") or []) or "-"
         rid = h.get("recipe_id") or h.get("id") or "?"
         kind = h.get("kind") or "serve_recipe"
+        # Display position is the rank truth — hybrid hits can carry a stale
+        # BM25 rank from the fused dict; never show it out of order.
+        rank = rank_i
         if kind != "serve_recipe":
             print(
-                f"#{h['rank']:<2} {h['score']:7.3f}  {str(rid)[:50]:<50} "
+                f"#{rank:<2} {h['score']:7.3f}  {str(rid)[:50]:<50} "
                 f"kind={kind}  {(h.get('title') or h.get('name') or h.get('search_text') or '')[:60]}"
             )
             continue
         print(
-            f"#{h['rank']:<2} {h['score']:7.3f}  {str(rid):<42} "
+            f"#{rank:<2} {h['score']:7.3f}  {str(rid):<42} "
             f"q={h.get('quant') or '?':8} {h.get('engine')}/{h.get('backend')} "
             f"accel=[{acc}]  {h.get('name')}"
         )
@@ -262,10 +274,11 @@ def main() -> int:
     ap.add_argument("--index", type=Path, default=DEFAULT_INDEX)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p_s = sub.add_parser("search", help="BM25 search recipes")
+    p_s = sub.add_parser("search", help="Search recipes (BM25; --hybrid adds RRF fusion with Qwen3-VL embeddings)")
     p_s.add_argument("query")
     p_s.add_argument("--top-k", type=int, default=8)
     p_s.add_argument("--json", action="store_true")
+    p_s.add_argument("--hybrid", action="store_true", help="RRF-fuse BM25 with embedding ranks (needs bm25_index/vectors.npy; run embed_model_kb.py)")
     p_s.set_defaults(func=cmd_search)
 
     p_g = sub.add_parser("get", help="Get recipe + ServeRequest body")

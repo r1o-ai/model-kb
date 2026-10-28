@@ -48,7 +48,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from lib.hf_hub import list_filter, relation_for, relation_slots_from_tags, relations_to_query
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_RECIPES = ROOT / "records.jsonl"
@@ -161,23 +161,52 @@ def resolve_root_base(hf_id: str, sleep_s: float) -> str:
     return current
 
 
-def fetch_family(base_id: str, limit: int = 80) -> list[dict[str, Any]]:
-    """Children declaring base_model:{base_id} via Hub filter API."""
-    q = quote(f"base_model:{base_id}", safe="")
-    # Hub uses filter= as tag filter
-    url = (
-        f"{HF_API}?filter={q}&limit={limit}&sort=downloads&direction=-1"
-        f"&full=true"
-    )
-    code, data = _http_json(url)
-    if code != 200 or not isinstance(data, list):
-        # fallback: other= form used by some hub UIs
-        url2 = f"{HF_API}?other={q}&limit={limit}&sort=downloads&direction=-1"
-        code, data = _http_json(url2)
-    if not isinstance(data, list):
-        return []
-    # also include the base itself
-    return data
+def fetch_family(base_id: str, limit: int = 0, sleep_s: float = 0.0) -> tuple[str, list[dict[str, Any]], bool]:
+    """Children of base_id across Hub relation filters.
+
+    Returns (status, members, truncated). status is ok | gated | unreachable | http_error.
+    A full page with no Link rel=next is truncated — not a complete tree.
+    limit > 0 is a test cap and forces truncated.
+    """
+    hard = limit if limit > 0 else 0
+    expressions = [f"base_model:{base_id}"]
+    expressions += [f"base_model:{slot}:{base_id}" for slot in relations_to_query()]
+    merged: dict[str, dict[str, Any]] = {}
+    truncated = False
+    seen_slots: set[str] = set()
+    queried = set(expressions)
+
+    def absorb(expr: str) -> str | None:
+        nonlocal truncated
+        kind, _status, rows, trunc = list_filter(expr, hard_limit=hard, sleep_s=sleep_s)
+        if kind in {"unreachable", "http_error", "gated"}:
+            return kind
+        if kind == "missing":
+            return None
+        if trunc:
+            truncated = True
+        for row in rows:
+            mid = row.get("id")
+            if isinstance(mid, str) and mid not in merged:
+                merged[mid] = row
+            seen_slots.update(relation_slots_from_tags(row.get("tags") or []))
+        return None
+
+    for expr in list(expressions):
+        err = absorb(expr)
+        if err:
+            return err, [], False
+    for slot in sorted(seen_slots):
+        expr = f"base_model:{slot}:{base_id}"
+        if expr in queried or slot == "untyped":
+            continue
+        queried.add(expr)
+        err = absorb(expr)
+        if err:
+            return err, [], False
+    return "ok", list(merged.values()), truncated
+
+
 
 
 def classify_member(m: dict[str, Any], root_base: str) -> str:
@@ -189,8 +218,9 @@ def classify_member(m: dict[str, Any], root_base: str) -> str:
     if mid == root_base:
         return "base"
 
-    # draft / dflash heads
-    if "dflash" in name or "mtp" in name or "draft" in name:
+    # Draft heads only. "mtp" in the name is a full checkpoint that kept MTP
+    # weights — component census decides whether those keys survived.
+    if "dflash" in name or name.endswith("-draft") or "/draft" in name or "-draft-" in name:
         return "draft_dflash"
 
     # unsloth first (preferred community quant line)
@@ -214,9 +244,8 @@ def classify_member(m: dict[str, Any], root_base: str) -> str:
     if "gguf" in tagset or name.endswith("-gguf") or "-gguf" in name:
         return "gguf_other"
 
-    # abliterated / uncensored finetunes
-    if any(x in name for x in ("abliterat", "uncensor", "heretic", "wasserstein")):
-        return "finetune_abliterated"
+    # Abliteration is a modifier (summarize_member), not a level. Putting it
+    # here hid GGUF/MLX format. Relation comes from Hub tags, not the name.
 
     # official org quants of same namespace
     root_ns = root_base.split("/")[0]
@@ -241,7 +270,12 @@ def level_label(level: str) -> str:
     }.get(level, f"9_{level}")
 
 
-def summarize_member(m: dict[str, Any], level: str) -> dict[str, Any]:
+def _modifiers(m: dict[str, Any]) -> list[str]:
+    blob = (str(m.get("id") or "") + " " + " ".join(str(t) for t in (m.get("tags") or []))).lower()
+    return [tok for tok in ("abliterat", "uncensor", "heretic") if tok in blob]
+
+
+def summarize_member(m: dict[str, Any], level: str, root_base: str) -> dict[str, Any]:
     tags = m.get("tags") or []
     quant_tags = [
         t
@@ -261,6 +295,9 @@ def summarize_member(m: dict[str, Any], level: str) -> dict[str, Any]:
         "level_rank": level_label(level),
         "quant_tags": quant_tags[:12],
         "library": m.get("library_name"),
+        "relation": relation_for(tags, root_base),
+        "modifiers": _modifiers(m),
+        "gated": bool(m.get("gated")) and m.get("gated") not in (False, "false"),
     }
 
 
@@ -268,27 +305,30 @@ def build_family_enrichment(
     root_base: str,
     members: list[dict[str, Any]],
     seed_artifacts: list[dict[str, str]],
+    truncated: bool = False,
 ) -> dict[str, Any]:
     levels: dict[str, list[dict[str, Any]]] = {}
-    # ensure base present
-    base_entry = next((m for m in members if m.get("id") == root_base), None)
-    if not base_entry:
-        base_entry = {"id": root_base, "downloads": 0, "likes": 0, "tags": []}
-        members = [base_entry] + members
-
+    # Do not invent a base row with downloads=0 when the list filter omits it.
     for m in members:
         level = classify_member(m, root_base)
-        levels.setdefault(level, []).append(summarize_member(m, level))
+        levels.setdefault(level, []).append(summarize_member(m, level, root_base))
 
     # sort each level by downloads
     for k in levels:
         levels[k].sort(key=lambda x: (-(x.get("downloads") or 0), x.get("id") or ""))
 
-    # pick recommended serve candidates for Apple Silicon
+    # Popularity per format level, round-robin. Not an engine recommendation.
     recommend = []
-    for key in ("mlx", "gguf_unsloth", "official_quant", "base", "draft_dflash"):
-        for m in levels.get(key, [])[:3]:
+    for i in range(2):
+        for key, rows in levels.items():
+            if key == "base" or i >= len(rows):
+                continue
+            m = rows[i]
             recommend.append({"id": m["id"], "level": key, "downloads": m["downloads"]})
+            if len(recommend) >= 12:
+                break
+        if len(recommend) >= 12:
+            break
 
     globs = [root_base, root_base.split("/")[-1], f"*{root_base.split('/')[-1]}*"]
     for a in seed_artifacts:
@@ -320,9 +360,9 @@ def build_family_enrichment(
             "model_globs": list(dict.fromkeys(g for g in globs if g)),
             "hf_ids": [root_base],
             "base_models": [root_base],
-            "family_member_ids": flat_ids[:100],
+            "family_member_ids": flat_ids,
             "accel_types": [],
-            "engines": ["mlx_lm", "mlx_vlm", "ds4"],
+            "engines": [],
         },
         "claims": [
             f"{len(flat_ids)} Hub variants under base_model:{root_base}",
@@ -333,7 +373,8 @@ def build_family_enrichment(
             "family_levels": levels,
             "member_count": len(flat_ids),
             "recommend_serve": recommend[:12],
-            "api": f"GET /api/models?filter=base_model:{root_base}",
+            "truncated": truncated,
+            "api": "GET /api/models?filter=base_model:{id} and base_model:{relation}:{id}",
         },
         "confidence": "measured" if len(flat_ids) > 1 else "pointer",
         "search_text": " ".join(x for x in search_bits if x).lower(),
@@ -392,7 +433,8 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
     ap.add_argument("--base", action="append", default=[], help="Explicit base id (repeatable)")
     ap.add_argument("--limit", type=int, default=0, help="Max bases from recipes (0=all)")
-    ap.add_argument("--family-limit", type=int, default=60, help="Max children per base from Hub")
+    ap.add_argument("--family-limit", type=int, default=0, help="Test cap. 0 = exhaust pages. A cap is truncated and exits 1 unless --allow-truncated")
+    ap.add_argument("--allow-truncated", action="store_true")
     ap.add_argument("--sleep", type=float, default=0.4)
     ap.add_argument("--join", action="store_true")
     args = ap.parse_args()
@@ -421,38 +463,49 @@ def main() -> int:
 
     print(f"unique roots: {len(roots)}")
     written = 0
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    with args.out.open("w") as fout:
-        for root, seeds in sorted(roots.items()):
-            members = fetch_family(root, limit=args.family_limit)
-            time.sleep(args.sleep)
-            # enrich members with tags when list endpoint is sparse
-            rich: list[dict[str, Any]] = []
-            for m in members:
-                mid = m.get("id")
-                if not mid:
-                    continue
-                # list endpoint often already has tags/downloads
-                if m.get("tags") is None:
-                    code, full = _http_json(f"{HF_API}/{mid}")
-                    time.sleep(args.sleep * 0.5)
-                    if code == 200 and isinstance(full, dict):
-                        m = full
-                rich.append(m)
-            if not rich:
-                # still write stub with base only
-                code, base_api = _http_json(f"{HF_API}/{root}")
-                time.sleep(args.sleep)
-                if code == 200 and isinstance(base_api, dict):
-                    rich = [base_api]
-            rec = build_family_enrichment(root, rich, seeds)
-            fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            written += 1
-            mc = rec["measurements"]["member_count"]
-            levels = {k: len(v) for k, v in rec["measurements"]["family_levels"].items()}
-            print(f"  + {root}: members={mc} levels={levels}")
+    pending: list[dict[str, Any]] = []
+    exit_code = 0
+    for root, seeds in sorted(roots.items()):
+        status, members, truncated = fetch_family(root, limit=args.family_limit, sleep_s=args.sleep)
+        if status != "ok":
+            print(f"FAIL: family list {status} for {root} — not writing an empty tree")
+            return 1
+        if truncated and not args.allow_truncated:
+            print(f"FAIL: family list truncated for {root}")
+            return 1
+        if truncated:
+            exit_code = 1
+        rich: list[dict[str, Any]] = []
+        for m in members:
+            mid = m.get("id")
+            if not mid:
+                continue
+            if m.get("tags") is None:
+                code, full = _http_json(f"{HF_API}/{mid}")
+                time.sleep(args.sleep * 0.5)
+                if code == 200 and isinstance(full, dict):
+                    m = full
+                elif code in (401, 403):
+                    m = {**m, "gated": True, "tags": m.get("tags") or []}
+            rich.append(m)
+        rec = build_family_enrichment(root, rich, seeds, truncated=truncated)
+        pending.append(rec)
+        written += 1
+        mc = rec["measurements"]["member_count"]
+        levels = {k: len(v) for k, v in rec["measurements"]["family_levels"].items()}
+        print(f"  + {root}: members={mc} truncated={truncated} levels={levels}")
 
+    if not pending:
+        print("FAIL: no family rows")
+        return 1
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = args.out.with_suffix(args.out.suffix + ".tmp")
+    tmp.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in pending))
+    tmp.replace(args.out)
     print(f"wrote {written} → {args.out}")
+    if exit_code:
+        print("FAIL: truncated family walk. ingest_derivative_audit.py will refuse this file.")
+        return exit_code
 
     if args.join and written:
         import subprocess
