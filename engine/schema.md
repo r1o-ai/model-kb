@@ -251,15 +251,50 @@ interface ServeRequest {
 
 ### Mapping recipe → asmi (rules)
 
+asmi's `POST /serve/load` is the contract (MA, 2026-10-31): model-kb adapts
+to asmi, never the other way. A serve config's `serve` section is carried
+whole into the recipe, and every asmi LoadRequest field in it reaches the load
+under the same name with the same value. Nothing picks a subset; nothing
+renames a field or adds one. The field set and its JSON types are
+`engine/lib/asmi_load.py` `LOAD_REQUEST_FIELDS`, the whole of apple-smi
+`crates/cluster-monitor/src/types.rs` `LoadRequest`; a test compares the two
+whenever the apple-smi source is on disk.
+
 | Recipe field | asmi `/serve/load` |
 |--------------|-------------------|
-| `serve.engine` | `engine` (guard via required_engine) |
-| `serve.backend` | `backend` — **force `single` unless RDMA recipe + mesh ready** |
-| `serve.port` | query `?port=` |
-| `accelerators[dflash].draft_model` | `draft_model` + engine dflash family |
-| `accelerators[turboquant].params` | `cache_type` / engine-specific params |
-| `accelerators[jaccl]` | `backend: jaccl` + hostfile from launch template |
-| `launch.curl` | fallback only if asmi body incomplete |
+| `serve.<any LoadRequest field>` | the same field, unchanged (`engine`, `backend`, `hostfile`, `draft_model`, `num_draft_tokens`, `decode_concurrency`, `prompt_concurrency`, `prefill_step_size`, `pipeline`, `prompt_cache_size`, `prompt_cache_bytes`, `use_mtp`, `cache_type`, `max_tokens`, `kv_bits`, `kv_quant_scheme`, `vision_cache_size`, `ctx_size`, `max_num_seqs`, `draft_kind`, `draft_block_size`, `drafter`, `env`, `extra_args`, `params`) |
+| `serve.extra_args` | `extra_args`: a list of strings (pre-split argv), appended last to the engine command. asmi refuses `--port`, `--host`, `--model`, `--metal`, any `-m…` token and `..`. A recipe is one model on one engine, so a flat list is engine-bound; there is no per-engine map. |
+| `serve.port` | query `?port=` (not a LoadRequest field) |
+| `serve.backend` | `backend` — `single` or `jaccl` only; anything else is recorded as `single` with a warning |
+| `artifact.path` (config `model.path`) | `model_path` (else `~/Models/<name>`) |
+| `accelerators[].draft_model` | `draft_model`, only when `serve.draft_model` is unset |
+| any other `serve` key (`hardware`, `os`, `nodes`, `host`, `python`, …) | not sent; listed as `serve_keys_not_sent` |
+
+Which flag each field becomes is the engine record's: `GET /serve/engines` →
+`engines[].fields[].request_field`. asmi ignores a field the engine has no
+rule for. A flag no record models goes in `extra_args` (or `params` for a
+record's `{param.KEY}` template, or `env`).
+
+**Not loadable, never guessed.** `ingest_serve_configs.py` sets `problems[]`,
+`warnings[]` and `loadable` on every recipe:
+
+- no `serve.engine` → `engine: null`, a problem; never a default engine;
+- `serve.extra_args` that is not a list of strings → dropped from the recipe
+  (never split or coerced), a problem naming the value;
+- a value asmi would refuse for its type (e.g. a word in `prompt_cache_size`) →
+  a problem naming the field, the value and the type asmi takes.
+
+`materialize_load()` returns `{asmi_body, port, problems, warnings,
+not_sent, loadable}`; `recipe_to_serve_request()` raises `ValueError` naming
+every problem. `verify.py` lists every NOT LOADABLE recipe and runs the round
+trip (config `serve` vs recipe `serve`: dropped / changed / unmatched); a
+dropped or changed key that no problem or warning names fails verify, and is
+classified against the live `request_field` set (asmi unreachable = a named
+failure).
+
+When a flag did not reach the engine, look at the running slot:
+`GET /serve/status` → `servers[].request` is the LoadRequest asmi started that
+process with, `extra_args` included.
 
 **Hard rules**
 
@@ -343,7 +378,7 @@ Graph name if docs ever go FalkorDB: **`MODEL_SERVING_DOCS`** only — never `WI
 2. BM25 `dflash 4bit` returns dflash recipes before baseline.  
 3. BM25 `mxfp4 jaccl` returns minimax multi-node profiles.  
 4. Filter `min_tps=35` drops weak benchmarks.  
-5. `recipe_to_serve_request(id)` produces asmi-valid body; `backend` never `auto`.  
+5. `recipe_to_serve_request(id)` produces an asmi-valid body (asmi LoadRequest fields only, port as `?port=`); `backend` never `auto`; an unloadable recipe raises with every problem named.  
 6. Live `model_serving()` ignores stale KB, hits asmi.  
 7. Load via recipe for currently free port succeeds; engine guard rejects ds4 under mlx_lm.
 

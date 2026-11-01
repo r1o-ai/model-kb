@@ -205,15 +205,21 @@ print(f'  with benchmarks[]:  {len([r for r in rc if r.get(\"benchmarks\")])}')
 print(f'  with known_issues:  {len([r for r in rc if r.get(\"known_issues\")])}')
 print(f'  with hf_family:     {len([r for r in rc if r.get(\"hf_family\")])}')
 print(f'  explicit model path:{len([r for r in rc if (r.get(\"artifact\") or {}).get(\"path\")])}')
-# engines must exist in the r1o engine registry (src/lib/engine-config.ts)
-KNOWN={'mlx_lm','mlx_vlm','vllm_mlx','dflash','ds4','glmx','mtplx','mlx_turbo','llama_cpp','omlx','janq'}
+# engines must exist in asmi GET /serve/engines on some online node (live union; fails closed)
+import sys; sys.path.insert(0, '.')
+from lib.engines import live_engine_ids
+known=live_engine_ids()
 bad=[(r['recipe_id'],(r.get('serve') or {}).get('engine')) for r in rc
-     if (r.get('serve') or {}).get('engine') not in KNOWN]
-print('UNKNOWN ENGINES (advisor cannot build a command):', bad or 'none')
+     if (r.get('serve') or {}).get('engine') not in known]
+print('UNKNOWN ENGINES (no online node declares them):', bad or 'none')
 missing=[r['recipe_id'] for r in rc if not (r.get('serve') or {}).get('engine')]
 print('ENGINE-LESS recipes:', missing or 'none')
+print('NOT LOADABLE:', [(r['recipe_id'], r.get('problems')) for r in rc if r.get('loadable') is False] or 'none')
 "
 ```
+
+`python3 verify.py` runs the same checks plus the asmi round trip (config
+`serve` vs recipe `serve`).
 
 Then confirm the web advisor still retrieves:
 ```bash
@@ -227,7 +233,7 @@ cd ~/Projects/r1o/web && npx vitest run src/lib/model-kb/
 2. **Order respected?** `recipes` never run last or alone on a populated corpus. (REQUIRED)
 3. **No kind zeroed?** Post-ingest counts compared against the baseline. (REQUIRED)
 4. **Index rebuilt?** `build_bm25.py --rebuild` after any records change. (REQUIRED)
-5. **Engines valid?** Every recipe engine exists in `src/lib/engine-config.ts` `ENGINES`. (REQUIRED)
+5. **Engines valid?** Every recipe engine exists in asmi `GET /serve/engines` on some online node (live; unreachable asmi = a named failure). (REQUIRED)
 6. **Upstream fixed, not the corpus?** No hand-edited records.jsonl rows. (REQUIRED)
 </evaluation-criteria>
 

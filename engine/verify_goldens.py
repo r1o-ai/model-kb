@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from build_bm25 import load_index, load_records, search  # noqa: E402
-from ingest_serve_configs import normalize_quant, recipe_to_serve_request  # noqa: E402
+from ingest_serve_configs import materialize_load, normalize_quant  # noqa: E402
 
 
 def _load_yaml(path: Path) -> dict:
@@ -144,13 +144,17 @@ def run_unit(q: dict, records: list[dict]) -> tuple[bool, str]:
         return ok, f"serve_recipe_count={n}"
 
     if qid == "q-serve-request-no-auto" or "recipe_to_serve_request" in assertion:
+        # An unloadable recipe still materializes (its problems are named), so
+        # the no-auto / model_path rules hold for every recipe.
         for r in records:
+            if r.get("kind") != "serve_recipe":
+                continue
             host = (
                 "~/.r1o/hostfiles/default.json"
                 if r.get("serve", {}).get("backend") == "jaccl"
                 else None
             )
-            body = recipe_to_serve_request(r, hostfile=host)
+            body = materialize_load(r, hostfile=host)["asmi_body"]
             if body.get("backend") == "auto":
                 return False, f"{r.get('recipe_id')} backend=auto"
             if "model_path" not in body:
