@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from build_bm25 import load_index, load_records, search as bm25_search  # noqa: E402
-from ingest_serve_configs import recipe_to_serve_request  # noqa: E402
+from ingest_serve_configs import asmi_body_of, materialize_load  # noqa: E402
 
 DEFAULT_RECORDS = ROOT / "records.jsonl"
 DEFAULT_INDEX = ROOT / "bm25_index" / "index.pkl"
@@ -87,24 +87,28 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+DEFAULT_HOSTFILE = Path.home() / ".r1o" / "hostfiles" / "default.json"
+
+
+def _plan(rec: dict, args: argparse.Namespace) -> dict:
+    """materialize_load + the CLI overrides. A recipe's own serve.hostfile wins
+    over the default; an explicit --hostfile / --port wins over both."""
+    plan = materialize_load(rec, hostfile=str(DEFAULT_HOSTFILE))
+    body = plan["asmi_body"]
+    if getattr(args, "hostfile", None) and body.get("backend") == "jaccl":
+        body["hostfile"] = args.hostfile
+    if getattr(args, "port", None):
+        plan["port"] = int(args.port)
+    return plan
+
+
 def cmd_get(args: argparse.Namespace) -> int:
     records = load_records(args.records)
     rec = _find_record(records, args.recipe_id)
     if not rec:
         print(f"not found: {args.recipe_id}", file=sys.stderr)
         return 1
-    hostfile = args.hostfile
-    if rec.get("serve", {}).get("backend") == "jaccl" and not hostfile:
-        hostfile = str(Path.home() / ".r1o" / "hostfiles" / "default.json")
-    try:
-        body = recipe_to_serve_request(rec, hostfile=hostfile if rec.get("serve", {}).get("backend") == "jaccl" else None)
-    except ValueError as e:
-        print(f"materialize error: {e}", file=sys.stderr)
-        return 1
-
-    # Optional port override for load tests
-    if args.port:
-        body["port"] = args.port
+    plan = _plan(rec, args)
 
     out = {
         "recipe_id": rec.get("recipe_id"),
@@ -115,11 +119,19 @@ def cmd_get(args: argparse.Namespace) -> int:
         "accelerators": rec.get("accelerators"),
         "hardware": rec.get("hardware"),
         "benchmarks": rec.get("benchmarks"),
-        "serve_request": body,
-        "asmi_body": {k: v for k, v in body.items() if k != "recipe_id"},
+        # asmi POST /serve/load?port=<port> with exactly asmi_body.
+        "asmi_body": plan["asmi_body"],
+        "port": plan["port"],
+        "loadable": plan["loadable"],
+        "problems": plan["problems"],
+        "warnings": plan["warnings"],
+        "serve_keys_not_sent": plan["not_sent"],
         "source": "model-kb",
     }
     print(json.dumps(out, indent=2, default=str))
+    if plan["problems"]:
+        print("not loadable: " + "; ".join(plan["problems"]), file=sys.stderr)
+        return 1
     return 0
 
 
@@ -162,24 +174,15 @@ def cmd_load(args: argparse.Namespace) -> int:
         print(f"not found: {args.recipe_id}", file=sys.stderr)
         return 1
 
-    backend = (rec.get("serve") or {}).get("backend") or "single"
-    if backend not in ("single", "jaccl"):
-        backend = "single"
-    hostfile = args.hostfile
-    if backend == "jaccl":
-        hostfile = hostfile or str(Path.home() / ".r1o" / "hostfiles" / "default.json")
-        if not Path(hostfile).expanduser().exists() and not args.dry_run:
-            print(f"jaccl hostfile missing: {hostfile}", file=sys.stderr)
-            return 1
-
-    try:
-        body = recipe_to_serve_request(rec, hostfile=hostfile if backend == "jaccl" else None)
-    except ValueError as e:
-        print(f"materialize error: {e}", file=sys.stderr)
+    plan = _plan(rec, args)
+    if plan["problems"]:
+        print("materialize error: not loadable: " + "; ".join(plan["problems"]), file=sys.stderr)
         return 1
-
-    if args.port:
-        body["port"] = int(args.port)
+    body = plan["asmi_body"]
+    hostfile = body.get("hostfile")
+    if body.get("backend") == "jaccl" and hostfile and not Path(hostfile).expanduser().exists() and not args.dry_run:
+        print(f"jaccl hostfile missing: {hostfile}", file=sys.stderr)
+        return 1
 
     # Hard bans
     if body.get("backend") == "auto":
@@ -189,7 +192,8 @@ def cmd_load(args: argparse.Namespace) -> int:
         print("REFUSE: missing model_path", file=sys.stderr)
         return 1
 
-    asmi_body = {k: v for k, v in body.items() if k != "recipe_id"}
+    asmi_body = asmi_body_of(body)
+    port = plan["port"]
     recipe_name = rec.get("recipe_id") or (rec.get("source") or {}).get("serve_config_name")
     # Only explicit --direct bypasses the r1o guarded apply path.
     # --port alone is recorded on the body for dry-run / direct tests, but
@@ -199,6 +203,9 @@ def cmd_load(args: argparse.Namespace) -> int:
     result = {
         "recipe_id": recipe_name,
         "asmi_body": asmi_body,
+        "port": port,
+        "warnings": plan["warnings"],
+        "serve_keys_not_sent": plan["not_sent"],
         "dry_run": bool(args.dry_run),
         "via": "dry-run" if args.dry_run else ("asmi-direct" if use_direct else "r1o-guarded-apply"),
     }
@@ -208,7 +215,7 @@ def cmd_load(args: argparse.Namespace) -> int:
         expanded = Path.home() / mp[2:] if mp.startswith("~/") else Path(mp).expanduser()
         result["model_path_exists"] = expanded.exists()
         result["model_path_resolved"] = str(expanded)
-        result["guarded_apply_url"] = f"{R1O_URL}/api/hermes/serve-configs/{recipe_name}/apply"
+        result["guarded_apply_url"] = f"{R1O_URL}/api/agent/serve-configs/{recipe_name}/apply"
         result["ok"] = True
         result["note"] = "dry-run only — no load call"
         print(json.dumps(result, indent=2, default=str))
@@ -216,16 +223,16 @@ def cmd_load(args: argparse.Namespace) -> int:
 
     # Live load: prefer r1o apply (guardedServeLoad). Only --direct → raw asmi.
     if use_direct:
-        # asmi selects slot via ?port= query, not body.port (daemon.rs).
-        port = int(asmi_body.get("port") or 19080)
-        path = f"/serve/load?port={port}"
+        # asmi selects the slot via ?port= (daemon.rs); without one it uses the
+        # engine record's default port — model-kb never guesses a number.
+        path = f"/serve/load?port={int(port)}" if port else "/serve/load"
         result["asmi_url"] = f"{ASMI_URL}{path}"
         code, data = _asmi_json("POST", path, asmi_body, timeout=float(args.timeout))
         result["http_status"] = code
         result["asmi"] = data
         result["ok"] = code in (200, 201)
     else:
-        url = f"{R1O_URL.rstrip('/')}/api/hermes/serve-configs/{recipe_name}/apply"
+        url = f"{R1O_URL.rstrip('/')}/api/agent/serve-configs/{recipe_name}/apply"
         result["apply_url"] = url
         # Optional port override still goes through guardedServeLoad.
         apply_payload: dict = {}
@@ -261,7 +268,6 @@ def cmd_load(args: argparse.Namespace) -> int:
     sc, status = _asmi_json("GET", "/serve/status", timeout=5)
     result["serve_status_http"] = sc
     if isinstance(status, dict):
-        port = asmi_body.get("port")
         match = [s for s in (status.get("servers") or []) if s.get("port") == port]
         result["port_status"] = match[0] if match else None
     print(json.dumps(result, indent=2, default=str))

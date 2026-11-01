@@ -38,14 +38,56 @@ export interface ModelKbQuant {
   bpw?: number | null;
 }
 
+/**
+ * A recipe's `serve` section: the serve config's own section, carried whole.
+ *
+ * The named fields are asmi `POST /serve/load` LoadRequest fields under asmi's
+ * names (apple-smi `types.rs`, mirrored in `engine/lib/asmi_load.py`); each
+ * one reaches the load unchanged. `port` goes to asmi as `?port=N`. Which flag
+ * a field becomes is the engine record's (`GET /serve/engines` →
+ * `fields[].request_field`). Any other key is config metadata (hardware, os,
+ * nodes, …): kept for search, never sent.
+ */
 export interface ModelKbServe {
+  /** asmi engine id. null = the config names none: the recipe is not loadable. */
   engine?: string | null;
+  /** single | jaccl (model-kb never sends auto). */
   backend?: string | null;
   port?: number | null;
-  decode_concurrency?: number | null;
-  prefill_step_size?: number | null;
-  prompt_cache_size?: number | null;
+  hostfile?: string | null;
   draft_model?: string | null;
+  num_draft_tokens?: number | null;
+  decode_concurrency?: number | null;
+  prompt_concurrency?: number | null;
+  prefill_step_size?: number | null;
+  pipeline?: boolean | null;
+  prompt_cache_size?: number | null;
+  prompt_cache_bytes?: number | null;
+  use_mtp?: boolean | null;
+  cache_type?: string | null;
+  max_tokens?: number | null;
+  kv_bits?: number | null;
+  kv_quant_scheme?: string | null;
+  vision_cache_size?: number | null;
+  ctx_size?: number | null;
+  max_num_seqs?: number | null;
+  draft_kind?: string | null;
+  draft_block_size?: number | null;
+  drafter?: string | null;
+  /**
+   * Engine flags asmi does not model: pre-split argv appended last to the
+   * engine command. asmi refuses --port, --host, --model, --metal, any -m…
+   * token and any token containing `..`. Ingest drops a value that is not a
+   * list of strings and names it in the record's `problems`.
+   */
+  extra_args?: string[] | null;
+  /** `{param.KEY}` values for an engine record's tmpl rules. */
+  params?: Record<string, string> | null;
+  /** Process environment (asmi allowlists keys by prefix). */
+  env?: Record<string, string> | null;
+  hardware?: string | null;
+  os?: string | null;
+  [configKey: string]: unknown;
 }
 
 export interface ModelKbAccelerator {
@@ -132,6 +174,16 @@ export interface ServeRecipeRecord extends ModelKbBase {
     asmi_path?: string | null;
     inventory_model_id?: string | null;
   } | null;
+  /** Why the recipe cannot load as recorded, each named. Empty = loadable. */
+  problems?: string[] | null;
+  /** Verify-first notes (e.g. a backend recorded as single instead of auto). */
+  warnings?: string[] | null;
+  /** problems is empty. */
+  loadable?: boolean | null;
+  /** Some online node's asmi declares the engine (pipeline fold, live). */
+  servable?: boolean | null;
+  servable_on?: string[] | null;
+  servable_reason?: string | null;
 }
 
 export interface ResearchNoteRecord extends ModelKbBase {

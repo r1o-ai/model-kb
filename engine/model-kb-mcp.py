@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from build_bm25 import load_index, load_records, search as bm25_search  # noqa: E402
-from ingest_serve_configs import recipe_to_serve_request  # noqa: E402
+from ingest_serve_configs import asmi_body_of, materialize_load  # noqa: E402
 
 mcp = FastMCP("model-kb")
 
@@ -38,6 +38,7 @@ RECORDS = Path(os.getenv("MODEL_KB_RECORDS", str(ROOT / "records.jsonl")))
 INDEX = Path(os.getenv("MODEL_KB_INDEX", str(ROOT / "bm25_index" / "index.pkl")))
 ASMI_URL = os.getenv("ASMI_URL", "http://127.0.0.1:9090")
 R1O_URL = os.getenv("R1O_URL", "http://localhost:59408")
+DEFAULT_HOSTFILE = Path.home() / ".r1o" / "hostfiles" / "default.json"
 
 
 def _recipe_score(rec: dict) -> float:
@@ -420,7 +421,7 @@ def model_family(hf_id: str = "", recipe_id: str = "") -> dict:
         "hf_derivative": rec.get("hf_derivative"),
         "community_quality": rec.get("community_quality"),
         "enrichment_links": rec.get("enrichment_links"),
-        "hint": "recommend_serve is popularity per format level, not an engine. hf_derivative lists component drops and gated ids. local benchmarks[] for tok/s. Engine comes from the recipe plus engine-config.ts.",
+        "hint": "recommend_serve is popularity per format level, not an engine. hf_derivative lists component drops and gated ids. local benchmarks[] for tok/s. Engine comes from the recipe; asmi GET /serve/engines is the engine list.",
         "source": "model-kb",
     }
 
@@ -437,25 +438,22 @@ def model_load(recipe_id: str, dry_run: bool = True) -> dict:
     """Load a recipe via r1o guarded apply route (guardedServeLoad).
 
     dry_run=True (default) only materializes + checks model_path exists.
-    dry_run=False POSTs /api/hermes/serve-configs/{name}/apply.
+    dry_run=False POSTs /api/agent/serve-configs/{name}/apply.
     """
     records = load_records(RECORDS)
     rec = _find(records, recipe_id)
     if not rec:
         return {"error": f"not found: {recipe_id}"}
-    backend = (rec.get("serve") or {}).get("backend") or "single"
-    if backend not in ("single", "jaccl"):
-        backend = "single"
-    hostfile = str(Path.home() / ".r1o" / "hostfiles" / "default.json") if backend == "jaccl" else None
-    try:
-        body = recipe_to_serve_request(rec, hostfile=hostfile if backend == "jaccl" else None)
-    except ValueError as e:
-        return {"ok": False, "error": str(e)}
+    plan = materialize_load(rec, hostfile=str(DEFAULT_HOSTFILE))
+    if plan["problems"]:
+        return {"ok": False, "recipe_id": rec.get("recipe_id"), "loadable": False,
+                "error": "not loadable as recorded", "problems": plan["problems"],
+                "warnings": plan["warnings"]}
 
-    if body.get("backend") == "auto" or "model_path" not in body:
+    asmi_body = asmi_body_of(plan["asmi_body"])
+    if asmi_body.get("backend") == "auto" or "model_path" not in asmi_body:
         return {"ok": False, "error": "invalid ServeRequest (auto backend or missing model_path)"}
 
-    asmi_body = {k: v for k, v in body.items() if k != "recipe_id"}
     name = rec.get("recipe_id")
     mp = str(asmi_body.get("model_path") or "")
     expanded = Path.home() / mp[2:] if mp.startswith("~/") else Path(mp).expanduser()
@@ -463,10 +461,13 @@ def model_load(recipe_id: str, dry_run: bool = True) -> dict:
     out = {
         "recipe_id": name,
         "asmi_body": asmi_body,
+        "port": plan["port"],
+        "warnings": plan["warnings"],
+        "serve_keys_not_sent": plan["not_sent"],
         "model_path_exists": expanded.exists(),
         "model_path_resolved": str(expanded),
         "via": "dry-run" if dry_run else "r1o-guarded-apply",
-        "apply_url": f"{R1O_URL.rstrip('/')}/api/hermes/serve-configs/{name}/apply",
+        "apply_url": f"{R1O_URL.rstrip('/')}/api/agent/serve-configs/{name}/apply",
     }
 
     if dry_run:
@@ -486,7 +487,7 @@ def model_load(recipe_id: str, dry_run: bool = True) -> dict:
     sc, status = _http_json("GET", f"{ASMI_URL.rstrip('/')}/serve/status", timeout=5)
     out["serve_status_http"] = sc
     if isinstance(status, dict):
-        port = asmi_body.get("port")
+        port = plan["port"]
         match = [s for s in (status.get("servers") or []) if s.get("port") == port]
         out["port_status"] = match[0] if match else None
     return out
@@ -512,25 +513,26 @@ def model_serve(query: str, dry_run: bool = False) -> dict:
             "hint": "A research note is not a config. Add weights + a serve-config, then ingest.",
         }
 
-    backend = (rec.get("serve") or {}).get("backend") or "single"
-    if backend not in ("single", "jaccl"):
-        backend = "single"
-    hostfile = str(Path.home() / ".r1o" / "hostfiles" / "default.json") if backend == "jaccl" else None
-    try:
-        body = recipe_to_serve_request(rec, hostfile=hostfile if backend == "jaccl" else None)
-    except ValueError as e:
-        return {"ok": False, "error": str(e), "recipe_id": rec.get("recipe_id")}
+    plan = materialize_load(rec, hostfile=str(DEFAULT_HOSTFILE))
+    if plan["problems"]:
+        return {"ok": False, "recipe_id": rec.get("recipe_id"), "loadable": False,
+                "error": "not loadable as recorded", "problems": plan["problems"],
+                "warnings": plan["warnings"]}
+    body = asmi_body_of(plan["asmi_body"])
 
     mp = str(body.get("model_path") or "")
     expanded = _expand_path(mp)
-    port = body.get("port")
+    port = plan["port"]
     before = _reap_stale(keep_ports={int(port)} if port else set(), dry_run=dry_run)
 
     out: dict = {
         "recipe_id": rec.get("recipe_id"),
         "query": query,
         "score": _recipe_score(rec),
-        "asmi_body": {k: v for k, v in body.items() if k != "recipe_id"},
+        "asmi_body": body,
+        "port": port,
+        "warnings": plan["warnings"],
+        "serve_keys_not_sent": plan["not_sent"],
         "model_path_exists": expanded.exists(),
         "model_path_resolved": str(expanded),
         "reap_before": before,
@@ -548,9 +550,12 @@ def model_serve(query: str, dry_run: bool = False) -> dict:
         out["note"] = "dry-run — reported stale servers, stopped nothing, did not load"
         return out
 
+    # asmi takes the slot as ?port= (never body.port); without one it uses the
+    # engine record's default port.
+    load_path = f"/serve/load?port={int(port)}" if port else "/serve/load"
     code, data = _http_json(
         "POST",
-        f"{ASMI_URL.rstrip('/')}/serve/load",
+        f"{ASMI_URL.rstrip('/')}{load_path}",
         out["asmi_body"],
         timeout=180,
     )

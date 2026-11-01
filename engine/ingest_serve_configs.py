@@ -5,6 +5,12 @@ Phase B task 6 of model-kb ARDD plan (2026-07-11).
 SoT: ~/.r1o/serve-configs.json (never invent profiles).
 Output: records.jsonl (append-safe via rewrite of recipe:* rows only when run standalone).
 
+The `serve` section is carried whole, under its own names: asmi's
+`POST /serve/load` is the contract (lib/asmi_load.py), so every asmi field a
+config sets reaches the recipe and the load unchanged. Nothing here picks a
+subset, and nothing defaults an engine: a config without one gives a recipe
+that is not loadable, with the reason in `problems`.
+
 Usage:
   python3 ingest_serve_configs.py
   python3 ingest_serve_configs.py --out records.jsonl
@@ -13,13 +19,18 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+
+from lib.asmi_load import asmi_body_of, describe_type, serve_load_fields, type_ok  # noqa: E402
 DEFAULT_CONFIG = Path.home() / ".r1o" / "serve-configs.json"
 DEFAULT_OUT = ROOT / "records.jsonl"
 
@@ -183,6 +194,62 @@ def benches_from_config(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+BACKENDS = ("single", "jaccl")  # model-kb policy: never "auto" (asmi accepts it; model-kb does not send it)
+ENGINE_MISSING = (
+    "serve.engine missing: the serve config names no engine, so asmi cannot load it "
+    "(model-kb never guesses one); add serve.engine as asmi GET /serve/engines names it"
+)
+
+
+def recipe_serve(serve: dict[str, Any]) -> tuple[dict[str, Any], list[str], list[str]]:
+    """The config's `serve` section as the recipe records it, plus why it can't load.
+
+    Every key is kept under its own name: asmi LoadRequest fields reach the load
+    unchanged, and config-only keys (hardware, os, …) stay on the record for
+    search. Three things differ from the config, each one named:
+      - `extra_args` that is not a list of strings is dropped (never coerced)
+        and recorded as a problem: asmi takes pre-split argv only.
+      - `backend` other than single|jaccl is recorded as single, with a warning.
+      - no `engine` → engine null and a problem (never a default engine).
+    """
+    rec_serve = copy.deepcopy(serve) if isinstance(serve, dict) else {}
+    problems: list[str] = []
+    warnings: list[str] = []
+
+    if "extra_args" in rec_serve and rec_serve["extra_args"] is not None:
+        xa = rec_serve["extra_args"]
+        if not type_ok("string_list", xa):
+            del rec_serve["extra_args"]
+            problems.append(
+                f"serve.extra_args dropped: it is {xa!r} ({type(xa).__name__}), but asmi "
+                f"LoadRequest.extra_args takes {describe_type('string_list')}; fix the serve config"
+            )
+
+    engine = rec_serve.get("engine") or None
+    rec_serve["engine"] = engine
+    if not engine:
+        problems.append(ENGINE_MISSING)
+
+    raw_backend = rec_serve.get("backend")
+    backend = raw_backend or "single"
+    if backend not in BACKENDS:
+        warnings.append(
+            f"serve.backend {raw_backend!r} is loaded as 'single': model-kb sends only "
+            f"{' or '.join(BACKENDS)}, never auto"
+        )
+        backend = "single"
+    rec_serve["backend"] = backend
+
+    checked = serve_load_fields(rec_serve)
+    problems += checked["problems"]
+    warnings += checked["warnings"]
+    return rec_serve, _dedupe(problems), _dedupe(warnings)
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    return list(dict.fromkeys(items))
+
+
 def recipe_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
     name = cfg.get("name") or "unnamed"
     model = cfg.get("model") or {}
@@ -190,10 +257,7 @@ def recipe_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
     hardware = cfg.get("hardware") or {}
     node_profile = hardware.get("node_profile") or {}
 
-    # backend hard ban: only single|jaccl
-    backend = serve.get("backend") or "single"
-    if backend not in ("single", "jaccl"):
-        backend = "single"
+    rec_serve, problems, warnings = recipe_serve(serve)
 
     recipe_id = name
     record_id = f"recipe:{recipe_id}"
@@ -233,17 +297,7 @@ def recipe_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
             or bool(model.get("params_active")),
         },
         "quant": quant,
-        "serve": {
-            "engine": serve.get("engine") or None,
-            "hardware": serve.get("hardware") or None,
-            "os": serve.get("os") or None,
-            "backend": backend,
-            "port": serve.get("port"),
-            "decode_concurrency": serve.get("decode_concurrency") or 1,
-            "prefill_step_size": serve.get("prefill_step_size"),
-            "prompt_cache_size": serve.get("prompt_cache_size"),
-            "draft_model": serve.get("draft_model"),
-        },
+        "serve": rec_serve,
         "accelerators": accels,
         "hardware": {
             "min_nodes": hardware.get("min_nodes") or 1,
@@ -268,6 +322,11 @@ def recipe_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "created": cfg.get("created"),
         "sampling": cfg.get("sampling"),
     }
+    # Why this recipe cannot load as recorded (empty = loadable). The body
+    # builder (materialize_load) applies the same rules again at load time.
+    rec["problems"] = problems
+    rec["warnings"] = warnings
+    rec["loadable"] = not problems
 
     # Draft safety: never task/smol/default if dflash draft arch or name
     is_draft = False
@@ -290,60 +349,83 @@ def recipe_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return rec
 
 
-def recipe_to_serve_request(rec: dict[str, Any], hostfile: str | None = None) -> dict[str, Any]:
-    """Materialize asmi /serve/load body (parity with r1o apply route).
+def materialize_load(rec: dict[str, Any], hostfile: str | None = None) -> dict[str, Any]:
+    """The asmi /serve/load request a recipe makes, and why it can't load.
 
-    Required keys: model_path, engine, backend, port.
-    backend ∈ {single, jaccl} only — never auto.
-    Propagates draft_model / prefill / decode / accelerators so load keeps the recipe.
+    Returns {asmi_body, port, problems, warnings, not_sent, loadable}:
+      asmi_body — asmi LoadRequest fields only: every one the recipe's `serve`
+                  sets, unchanged, plus model_path (artifact.path, else
+                  ~/Models/<name>, the apply route's convention) and the draft
+                  model from the first enabled accelerator when serve has none.
+      port      — asmi takes it as ?port=N, never in the body.
+      not_sent  — serve keys that are not asmi fields (config metadata).
+    `hostfile` is the caller's fallback for a jaccl recipe that records none;
+    a recipe's own serve.hostfile wins. backend is single|jaccl only.
     """
     serve = rec.get("serve") or {}
     art = rec.get("artifact") or {}
-    backend = serve.get("backend") or "single"
-    if backend not in ("single", "jaccl"):
+    problems: list[str] = list(rec.get("problems") or [])
+    warnings: list[str] = list(rec.get("warnings") or [])
+
+    checked = serve_load_fields(serve)
+    problems += checked["problems"]
+    warnings += checked["warnings"]
+    fields = dict(checked["fields"])
+
+    if not fields.get("engine"):
+        problems.append(ENGINE_MISSING)
+    backend = fields.get("backend") or "single"
+    if backend not in BACKENDS:
+        warnings.append(f"serve.backend {backend!r} is loaded as 'single' (model-kb never sends auto)")
         backend = "single"
+    fields["backend"] = backend
 
-    # Prefer real path; else ~/Models/<name> (same as apply route).
     name = art.get("name") or rec.get("recipe_id") or "unknown"
-    # serve-configs may stash path under model.path (copied into artifact when present)
-    model_path = art.get("path") or f"~/Models/{name}"
+    fields["model_path"] = art.get("path") or f"~/Models/{name}"
 
-    body: dict[str, Any] = {
-        "model_path": model_path,
-        "engine": serve.get("engine") or None,
-        "backend": backend,
-        "port": serve.get("port"),
-        "decode_concurrency": serve.get("decode_concurrency") or 1,
-        "recipe_id": rec.get("recipe_id") or rec.get("id"),
-    }
-
-    draft = serve.get("draft_model")
-    if not draft:
-        # fall back to first enabled accel draft_model (dflash profiles)
+    if not fields.get("draft_model"):
         for a in rec.get("accelerators") or []:
             if a.get("enabled", True) and a.get("draft_model"):
-                draft = a.get("draft_model")
+                fields["draft_model"] = a["draft_model"]
                 break
-    if draft:
-        body["draft_model"] = draft
-    if serve.get("prefill_step_size") is not None:
-        body["prefill_step_size"] = serve["prefill_step_size"]
-    if serve.get("prompt_cache_size") is not None:
-        body["prompt_cache_size"] = serve["prompt_cache_size"]
 
-    # Pass enabled accelerator types so downstream can enable TQ/DFlash/etc.
+    if backend == "jaccl" and not fields.get("hostfile"):
+        if hostfile:
+            fields["hostfile"] = hostfile
+        else:
+            problems.append("jaccl requires explicit hostfile path (serve.hostfile or the caller's)")
+
+    problems = _dedupe(problems)
+    return {
+        "asmi_body": fields,
+        "port": serve.get("port"),
+        "problems": problems,
+        "warnings": _dedupe(warnings),
+        "not_sent": checked["not_sent"],
+        "loadable": not problems,
+    }
+
+
+def recipe_to_serve_request(rec: dict[str, Any], hostfile: str | None = None) -> dict[str, Any]:
+    """model-kb's serve request for a recipe: the asmi body + port + recipe_id + accelerators.
+
+    Raises ValueError naming every problem when the recipe cannot load as
+    recorded. POST only `asmi_body_of(request)` to asmi, with the port as
+    ?port= — `port`, `recipe_id` and `accelerators` are model-kb keys.
+    """
+    plan = materialize_load(rec, hostfile=hostfile)
+    if plan["problems"]:
+        raise ValueError(f"recipe {rec.get('recipe_id') or rec.get('id')} is not loadable: " + "; ".join(plan["problems"]))
+    req: dict[str, Any] = dict(plan["asmi_body"])
+    req["port"] = plan["port"]
+    req["recipe_id"] = rec.get("recipe_id") or rec.get("id")
     accels = [a for a in (rec.get("accelerators") or []) if a.get("enabled", True)]
     if accels:
-        body["accelerators"] = [
+        req["accelerators"] = [
             {"type": a.get("type"), "params": a.get("params") or {}, "draft_model": a.get("draft_model")}
             for a in accels
         ]
-
-    if backend == "jaccl":
-        if not hostfile:
-            raise ValueError("jaccl requires explicit hostfile path")
-        body["hostfile"] = hostfile
-    return body
+    return req
 
 
 def load_configs(path: Path) -> list[dict[str, Any]]:
@@ -364,12 +446,12 @@ def main() -> int:
     configs = load_configs(args.config)
     records = [recipe_from_config(c) for c in configs]
 
-    # backend ban unit check
+    # backend ban unit check (an unloadable recipe is recorded, not fatal)
     for r in records:
         b = r["serve"]["backend"]
-        assert b in ("single", "jaccl"), r["id"]
-        req = recipe_to_serve_request(r, hostfile="~/.r1o/hostfiles/default.json" if b == "jaccl" else None)
-        assert req["backend"] != "auto"
+        assert b in BACKENDS, r["id"]
+        plan = materialize_load(r, hostfile="~/.r1o/hostfiles/default.json" if b == "jaccl" else None)
+        assert plan["asmi_body"]["backend"] != "auto"
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w") as f:
@@ -381,6 +463,9 @@ def main() -> int:
     dflash = sum(1 for r in records if any(a.get("type") == "dflash" and a.get("enabled") for a in r["accelerators"]))
     jaccl = sum(1 for r in records if r["serve"]["backend"] == "jaccl")
     print(f"  dflash={dflash} jaccl={jaccl}")
+    for r in records:
+        if not r["loadable"]:
+            print(f"  NOT LOADABLE {r['recipe_id']}: " + "; ".join(r["problems"]))
     return 0
 
 
