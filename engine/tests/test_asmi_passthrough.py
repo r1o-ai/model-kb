@@ -214,6 +214,15 @@ class TestFailClosed(unittest.TestCase):
                          "~/fallback.json")
         self.assertIn("jaccl requires explicit hostfile", isc.materialize_load(bare)["problems"][0])
 
+    def test_a_tilde_hostfile_is_sent_as_saved_with_a_warning(self):
+        # asmi checks the hostfile path as given (no ~ expansion) and falls back
+        # to single when it is missing — say so, never rewrite the value.
+        rec = isc.recipe_from_config(_cfg({"engine": "fx_engine", "backend": "jaccl",
+                                           "hostfile": "~/.mlx/fx.json"}))
+        plan = isc.materialize_load(rec)
+        self.assertEqual(plan["asmi_body"]["hostfile"], "~/.mlx/fx.json")
+        self.assertTrue(any("no ~ expansion" in w for w in plan["warnings"]), plan["warnings"])
+
 
 class TestIngestCli(unittest.TestCase):
     def test_ingest_records_an_unloadable_recipe_instead_of_crashing(self):

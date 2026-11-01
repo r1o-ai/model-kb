@@ -389,6 +389,12 @@ def materialize_load(rec: dict[str, Any], hostfile: str | None = None) -> dict[s
                 fields["draft_model"] = a["draft_model"]
                 break
 
+    hf = fields.get("hostfile")
+    if isinstance(hf, str) and hf.startswith("~"):
+        warnings.append(
+            f"serve.hostfile {hf!r} starts with ~: asmi checks the path as given (no ~ expansion) and "
+            "falls back to single when it is missing; a direct asmi load needs an absolute path"
+        )
     if backend == "jaccl" and not fields.get("hostfile"):
         if hostfile:
             fields["hostfile"] = hostfile
