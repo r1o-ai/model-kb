@@ -466,3 +466,25 @@ Batch: `enrich_optimization_transfer.py` → `recipe.optimization_transfer.trans
 MCP: `model_optimization_transfer`
 
 Example: Qwen MTP on base → same-base quant **likely ×0.88**; finetune **degraded ×0.55** (re-bench). DFlash draft **deny** across arch_class.
+
+
+## Derivative audit (proposed)
+
+Not a fifth copy of the family tree. `hf_family` answers "which repos declare
+this base". `hf_derivative` answers, for each of those repos, what the Hub
+actually stored:
+
+| Question | Live source | Fail closed when |
+|---|---|---|
+| Is it a finetune, quant, or merge? | Child tag `base_model:{slot}:{root}` | No tag → `relation=unknown`. Never from the repo name |
+| Did a submodule survive? | Official vs derivative `weight_map` key counts, groups collapsed from the official keys | Missing index → `no_safetensors_index`. HTTP 0/5xx → exit 1. Never "0 keys" |
+| Does the quant scheme match? | Both repos' `quantization_config` (or the first `*quant*` dict) | Unreadable → `parity=unreadable`. No expected byte size |
+| What did the card measure? | `cardData.model-index`, else README tables | No table → `unreported`. Not `confidence=measured` |
+| Can this node read it? | HTTP 401/403, token from env or HF token file | `gated_unauthenticated` + `token_source` name. Never store the token |
+| Which engine? | Sibling suffixes + `engine-config.ts` `modelPathKind` | Only `gguf-file` engines are proven for GGUF. Other formats: `flags_status=undeclared` until the registry grows `quantArg` |
+
+`serve.engine` is null when serve-configs omits it. Do not default `mlx_lm`.
+Joined recipe field is the summary (`component_drop_ids`, `gated_unauthenticated`,
+`relation_counts`), not the per-key maps.
+
+Spec the ingest skill loads: `~/.claude/skills/model-kb-ingest/refs/derivative-audit.md`.
