@@ -456,6 +456,20 @@ def _reusable(prev: dict[str, Any]) -> bool:
     return (prev.get("modification") or {}).get("status") not in {"gated_unauthenticated", "unreachable", "http_error"}
 
 
+def _reuse(
+    prev: dict[str, Any],
+    relation: str,
+    member: dict[str, Any],
+    path_kinds: dict[str, str | None],
+    how: str,
+) -> dict[str, Any]:
+    """Cached census for an unchanged commit. Downloads, relation and servability are not
+    content, so they are refreshed."""
+    row = {**prev, "relation": relation, "downloads": member.get("downloads") or 0, "cache": how}
+    row["servability"] = servability(row.get("formats") or [], (row.get("quant") or {}).get("quant_method"), path_kinds)
+    return row
+
+
 def audit_member(
     member: dict[str, Any],
     *,
@@ -476,6 +490,18 @@ def audit_member(
         "downloads": member.get("downloads") or 0,
         "access": "ok",
     }
+    prev = (cached or {}).get(repo)
+    # The family listing already carries the member's commit (expand[]=sha). Same commit, same
+    # official commit, settled cached row: reuse it without a per-repo call or a rate-limit sleep.
+    listing_sha = member.get("sha")
+    if (
+        prev
+        and listing_sha
+        and prev.get("sha") == listing_sha
+        and prev.get("official_sha") == official_sha
+        and _reusable(prev)
+    ):
+        return _reuse(prev, relation, member, path_kinds, "sha_match_listing")
     kind, api = repo_api(repo)
     time.sleep(sleep_s)
     if kind == "gated":
@@ -493,11 +519,8 @@ def audit_member(
     # Same commit, audited against the same official commit: the census cannot have changed.
     # Downloads and servability are not content, so they are refreshed.
     sha = api.get("sha")
-    prev = (cached or {}).get(repo)
     if prev and sha and prev.get("sha") == sha and prev.get("official_sha") == official_sha and _reusable(prev):
-        row = {**prev, "relation": relation, "downloads": member.get("downloads") or 0, "cache": "sha_match"}
-        row["servability"] = servability(row.get("formats") or [], (row.get("quant") or {}).get("quant_method"), path_kinds)
-        return row
+        return _reuse(prev, relation, member, path_kinds, "sha_match")
     row["sha"] = sha
     row["official_sha"] = official_sha
     row["audit_version"] = AUDIT_VERSION
@@ -817,8 +840,12 @@ def main() -> int:
         # gated_unauthenticated, so failing a release build over one would punish normal Hub state.
         official_status = off_status if off_groups is not None or off_status != "ok" else "no_index"
         rows.append(build_row(family, audited, official_status=official_status))
-        hits = sum(1 for r in audited if r.get("cache") == "sha_match")
-        print(f"  + {root}: audited={len(audited)} unchanged={hits} official={off_status}")
+        listing_hits = sum(1 for r in audited if r.get("cache") == "sha_match_listing")
+        hits = listing_hits + sum(1 for r in audited if r.get("cache") == "sha_match")
+        print(
+            f"  + {root}: audited={len(audited)} unchanged={hits} "
+            f"listing_sha_hits={listing_hits} official={off_status}"
+        )
 
     tmp = args.out.with_suffix(args.out.suffix + ".tmp")
     tmp.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))

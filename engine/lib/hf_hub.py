@@ -143,10 +143,15 @@ def list_filter(
     hard_limit: int = 0,
     sleep_s: float = 0.0,
     timeout: float = 40.0,
+    expand: tuple[str, ...] | list[str] | None = None,
 ) -> tuple[str, int, list[dict[str, Any]], bool]:
     """Paginate GET /api/models?filter=…
 
     Returns (class, http_status, models, truncated).
+
+    expand: Hub field names to request instead of full=true. With expand[] the Hub returns
+    ONLY id plus the expanded fields, so a caller must name every field it reads. None keeps
+    full=true. The Hub carries expand into the Link rel=next URL.
 
     truncated is True when a full page came back with no Link rel=next,
     or when hard_limit stopped the walk. A full page without a next link
@@ -155,9 +160,10 @@ def list_filter(
 
     On gated / unreachable / http_error, models is [] and class says why.
     """
+    fields = "".join(f"&expand%5B%5D={quote(f, safe='')}" for f in expand) if expand else "&full=true"
     url = (
         f"{HF_API}?filter={quote(filter_expr, safe='')}"
-        f"&limit={page_limit}&sort=downloads&direction=-1&full=true"
+        f"&limit={page_limit}&sort=downloads&direction=-1{fields}"
     )
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
