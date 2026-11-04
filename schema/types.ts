@@ -14,7 +14,8 @@ export type ModelKbKind =
   | 'cloud_context'
   | 'research_note'
   | 'hf_family'
-  | 'hf_card';
+  | 'hf_card'
+  | 'hf_derivative';
 
 export interface ModelKbArtifact {
   name?: string | null;
@@ -163,6 +164,8 @@ export interface ServeRecipeRecord extends ModelKbBase {
   known_issues?: string[] | null;
   verified_on?: ModelKbVerifiedOn[] | null;
   hf_family?: ModelKbHfFamily | null;
+  /** Joined summary only. Per-child rows live on the hf_derivative record. */
+  hf_derivative?: RecipeDerivativeSummary | null;
   community_quality?: Record<string, unknown> | null;
   enrichment_links?: unknown;
   /** Often empty in the corpus — infer live instead of treating as SoT. */
@@ -230,7 +233,63 @@ export interface HfFamilyRecord extends ModelKbBase {
 
 export interface HfCardRecord extends ModelKbBase {
   kind: 'hf_card';
+  measurements?: {
+    access?: string | null;
+    token_source?: string | null;
+    quality?: Record<string, number> | null;
+    quants?: Array<Record<string, unknown>> | null;
+  } | null;
   [key: string]: unknown;
+}
+
+/** One Hub child audited from its own config + safetensors index. */
+export interface HfDerivativeMember {
+  id?: string | null;
+  relation?: string | null;
+  access?: string | null;
+  token_source?: string | null;
+  formats?: string[] | null;
+  total_bytes?: number | null;
+  quant?: Record<string, unknown> | null;
+  quant_parity?: { parity?: string | null; diverge_fields?: string[] | null } | null;
+  components?: {
+    status?: string | null;
+    index?: string | null;
+    key_count?: number | null;
+    official_key_count?: number | null;
+    dropped_groups?: string[] | null;
+    shrunk_groups?: string[] | null;
+  } | null;
+  servability?: Record<string, unknown> | null;
+  modification?: Record<string, unknown> | null;
+}
+
+export interface HfDerivativeRecord extends ModelKbBase {
+  kind: 'hf_derivative';
+  measurements?: {
+    root_base?: string | null;
+    official_status?: string | null;
+    discovered?: number | null;
+    truncated?: boolean | null;
+    audited?: number | null;
+    relation_counts?: Record<string, number> | null;
+    component_drop_ids?: string[] | null;
+    gated_unauthenticated?: string[] | null;
+    token_source?: string | null;
+    derivatives?: HfDerivativeMember[] | null;
+  } | null;
+}
+
+export interface RecipeDerivativeSummary {
+  root_base?: string | null;
+  discovered?: number | null;
+  audited?: number | null;
+  truncated?: boolean | null;
+  relation_counts?: Record<string, number> | null;
+  component_drop_ids?: string[] | null;
+  gated_unauthenticated?: string[] | null;
+  official_status?: string | null;
+  enrichment_id?: string | null;
 }
 
 export type ModelKbRecord =
@@ -238,7 +297,8 @@ export type ModelKbRecord =
   | ResearchNoteRecord
   | CloudContextRecord
   | HfFamilyRecord
-  | HfCardRecord;
+  | HfCardRecord
+  | HfDerivativeRecord;
 
 export interface ModelKbSearchHit {
   id: string;
