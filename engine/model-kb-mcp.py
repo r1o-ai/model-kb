@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from build_bm25 import load_index, load_records, search as bm25_search  # noqa: E402
-from ingest_serve_configs import asmi_body_of, materialize_load  # noqa: E402
+from ingest_serve_configs import asmi_body_of, materialize_load, recipe_to_serve_request  # noqa: E402
 
 mcp = FastMCP("model-kb")
 
