@@ -483,6 +483,14 @@ actually stored:
 | Can this node read it? | HTTP 401/403, token from env or HF token file | `gated_unauthenticated` + `token_source` name. Never store the token |
 | Which engine? | Sibling suffixes + `engine-config.ts` `modelPathKind` | Only `gguf-file` engines are proven for GGUF. Other formats: `flags_status=undeclared` until the registry grows `quantArg` |
 
+Cache: the previous `enrichments_hf_derivative.jsonl` is the cache, keyed on the
+member's commit `sha` + the official root's `official_sha`. The family listing
+requests `expand[]=sha` (and every field it reads), so each `hf_family` member
+carries `sha`/`lastModified`; an unchanged member is reused with no per-repo call
+(`cache: sha_match_listing`). A member without a listing sha falls back to one
+`/api/models/{id}` call (`cache: sha_match`). Gated/unreachable rows are re-checked
+every run.
+
 `serve.engine` is null when serve-configs omits it. Do not default `mlx_lm`.
 Joined recipe field is the summary (`component_drop_ids`, `gated_unauthenticated`,
 `relation_counts`), not the per-key maps.

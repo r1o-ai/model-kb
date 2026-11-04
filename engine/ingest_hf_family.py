@@ -4,7 +4,8 @@
 HF exposes the "family tree" via list filter (not a dedicated /tree of models):
 
   GET https://huggingface.co/api/models?filter=base_model:{namespace/name}
-      &sort=downloads&direction=-1&limit=100
+      &sort=downloads&direction=-1&limit=100&expand[]=sha&expand[]=tags&…
+  (expand[] fields: LISTING_FIELDS; each member keeps its commit sha)
 
 Each child carries tags like:
   base_model:Qwen/Qwen3.5-35B-A3B
@@ -54,6 +55,21 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_RECIPES = ROOT / "records.jsonl"
 DEFAULT_OUT = ROOT / "enrichments_hf_family.jsonl"
 HF_API = "https://huggingface.co/api/models"
+
+# Hub expand[] field names for the family listing (API vocabulary, not a model list). With
+# expand[] the Hub returns only id + these fields, so this names every listing field
+# summarize_member / classify_member / relation_for read, plus sha + lastModified: the
+# commit the derivative audit keys its cache on, so an unchanged child needs no per-repo call.
+LISTING_FIELDS = (
+    "downloads",
+    "likes",
+    "tags",
+    "pipeline_tag",
+    "library_name",
+    "gated",
+    "sha",
+    "lastModified",
+)
 
 
 def _now() -> str:
@@ -178,7 +194,7 @@ def fetch_family(base_id: str, limit: int = 0, sleep_s: float = 0.0) -> tuple[st
 
     def absorb(expr: str) -> str | None:
         nonlocal truncated
-        kind, _status, rows, trunc = list_filter(expr, hard_limit=hard, sleep_s=sleep_s)
+        kind, _status, rows, trunc = list_filter(expr, hard_limit=hard, sleep_s=sleep_s, expand=LISTING_FIELDS)
         if kind in {"unreachable", "http_error", "gated"}:
             return kind
         if kind == "missing":
@@ -286,7 +302,7 @@ def summarize_member(m: dict[str, Any], level: str, root_base: str) -> dict[str,
             or t.startswith("base_model:")
         )
     ]
-    return {
+    out = {
         "id": m.get("id"),
         "downloads": m.get("downloads") or 0,
         "likes": m.get("likes") or 0,
@@ -299,6 +315,11 @@ def summarize_member(m: dict[str, Any], level: str, root_base: str) -> dict[str,
         "modifiers": _modifiers(m),
         "gated": bool(m.get("gated")) and m.get("gated") not in (False, "false"),
     }
+    # Commit at listing time: the derivative audit's cache key. Absent → the audit fetches it.
+    for key in ("sha", "lastModified"):
+        if isinstance(m.get(key), str) and m[key]:
+            out[key] = m[key]
+    return out
 
 
 def build_family_enrichment(
