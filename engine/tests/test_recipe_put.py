@@ -154,7 +154,7 @@ class KbCase(unittest.TestCase):
         os.environ.update(self.env)
         sys.path.insert(0, str(self.kb))
         for mod in [m for m in list(sys.modules)
-                    if m in ("recipe_store", "verify", "ingest_serve_configs") or m == "lib" or m.startswith("lib.")]:
+                    if m in ("recipe_store", "verify", "serve_recipes") or m == "lib" or m.startswith("lib.")]:
             del sys.modules[mod]
         import recipe_store  # noqa: PLC0415 — the temp copy, after env is set
 
@@ -206,16 +206,19 @@ class KbCase(unittest.TestCase):
 
     # -- corpus fixtures -------------------------------------------------
     def seed_serve_configs(self) -> None:
-        (self.home / ".r1o" / "serve-configs.json").write_text(json.dumps({"configs": [{
-            "name": "fx-model-1node",
-            "model": {"name": "Fx-Model-4bit", "hf_id": "fixture/Fx-Model"},
-            "serve": {"engine": "fx_engine", "backend": "single", "decode_concurrency": 2},
-            "sampling": {"temperature": 0.6},
-        }, {
-            "name": "fx-gone-1node",
-            "model": {"name": "Fx-Gone-4bit", "hf_id": "fixture/Fx-Gone"},
-            "serve": {"engine": "fx_gone", "backend": "single"},
-        }]}))
+        """Two named serve configs in the recipe store, filed the way the store-G
+        migration files them: research records keyed (model.name, serve.engine)."""
+        self.rs.put(self.kb, model="Fx-Model-4bit", engine="fx_engine", source="research", patch={"configs": {
+            "fx-model-1node": {
+                "model": {"name": "Fx-Model-4bit", "hf_id": "fixture/Fx-Model"},
+                "serve": {"engine": "fx_engine", "backend": "single", "decode_concurrency": 2},
+                "sampling": {"temperature": 0.6},
+            }}})
+        self.rs.put(self.kb, model="Fx-Gone-4bit", engine="fx_gone", source="research", patch={"configs": {
+            "fx-gone-1node": {
+                "model": {"name": "Fx-Gone-4bit", "hf_id": "fixture/Fx-Gone"},
+                "serve": {"engine": "fx_gone", "backend": "single"},
+            }}})
 
     def seed_research(self) -> None:
         notes = self.tmp / "notes"
@@ -251,11 +254,11 @@ class KbCase(unittest.TestCase):
         self.seed_serve_configs()
         self.seed_research()
         self.seed_hf_enrichments()
-        import ingest_serve_configs as isc  # noqa: PLC0415 — the temp copy
+        import serve_recipes  # noqa: PLC0415 — the temp copy
 
-        cfgs = json.loads((self.home / ".r1o" / "serve-configs.json").read_text())["configs"]
+        cfgs = serve_recipes.store_configs(self.kb)
         cloud = {"id": "cloud:fx", "kind": "cloud_context", "search_text": "fx cloud pack"}
-        _jsonl(self.kb / "records.jsonl", [isc.recipe_from_config(c) for c in cfgs] + [cloud])
+        _jsonl(self.kb / "records.jsonl", [serve_recipes.recipe_from_config(c) for c in cfgs] + [cloud])
 
     def generation_bytes(self) -> dict[str, bytes]:
         out = {}
@@ -420,10 +423,21 @@ class TestGeneration(KbCase):
             self.assertNotIn("ROLLED BACK", p.stdout)
             recs = self.aligned()
             authored = [r for r in recs if r.get("kind") == "authored_recipe"]
-            self.assertEqual(len(authored), 1, [r.get("id") for r in recs])
-            self.assertEqual(authored[0]["source"], "user")
-            self.assertEqual(authored[0]["recipe"]["sampling"], {"temperature": 0.2})
-            self.assertTrue(any(r.get("kind") == "serve_recipe" for r in recs), "the clobber step ran")
+            user = [r for r in authored if r["source"] == "user"]
+            self.assertEqual(len(user), 1, [r.get("id") for r in recs])
+            self.assertEqual(user[0]["recipe"]["sampling"], {"temperature": 0.2})
+            # A record that holds serve configs names them; their bodies are the serve_recipe rows.
+            research = {r["model"]: r for r in authored if r["source"] == "research"}
+            self.assertEqual(sorted(research), ["Fx-Gone-4bit", "Fx-Model-4bit"])
+            self.assertEqual(research["Fx-Model-4bit"]["serve_configs"], ["fx-model-1node"])
+            self.assertNotIn("configs", research["Fx-Model-4bit"]["recipe"])
+            # A hand-written recipe reads back like a serve_recipe row: its record's
+            # (model, engine) are the facts, so model_get / model_load can load it.
+            self.assertEqual(research["Fx-Gone-4bit"]["artifact"]["name"], "Fx-Gone-4bit")
+            self.assertEqual(research["Fx-Gone-4bit"]["serve"], {"engine": "fx_gone"})
+            self.assertEqual(user[0]["serve"]["engine"], "fx_engine")
+            self.assertEqual(sorted(r["recipe_id"] for r in recs if r.get("kind") == "serve_recipe"),
+                             ["fx-gone-1node", "fx-model-1node"], "the clobber step ran")
         self.assertEqual(self.rs.get(self.kb, model="fixture/Fx-Model", engine="fx_engine",
                                      source="user")["recipe"], {"sampling": {"temperature": 0.2}})
 

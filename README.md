@@ -50,8 +50,8 @@ they carry the things you only learn by running the thing.
 
 ## ⛔ The ordering trap — read this before any ingest
 
-**`ingest_serve_configs.py` opens `records.jsonl` with mode `"w"` and writes only
-`serve_recipe` rows.** Every `cloud_context`, `research_note`, `hf_family`, and `hf_card`
+**`serve_recipes.py` opens `records.jsonl` with mode `"w"` and writes only
+`serve_recipe` rows** (built from the recipe store, `recipes.jsonl`). Every `cloud_context`, `research_note`, `hf_family`, and `hf_card`
 record is destroyed. There is no warning, no diff, and **no non-zero exit** — the run prints
 success while the corpus silently loses most of its content.
 
@@ -129,7 +129,7 @@ The seed came from one deployment. To make it *yours*, repoint each ingest:
 
 | Ingest | Reads |
 |---|---|
-| `ingest_serve_configs.py` | your serve-config JSON (recipes you have actually run) |
+| `serve_recipes.py` | the recipe store `recipes.jsonl` (recipes you have actually run; write them with `model_recipe_put` / `recipe_store.py put`) |
 | `ingest_cloud_context.py` | provider APIs / a proxy's `/v1/models` |
 | `ingest_research.py` | your notes directory (markdown) |
 | `ingest_hf_family.py` | HF Hub `base_model` tree |
@@ -164,10 +164,19 @@ Because recipes carry `known_issues` and measurements, queries phrased as *probl
 ```
 
 Tools: `model_search`, `model_get`, `model_family`, `model_serving`, `model_load`,
-`model_optimization_transfer`.
+`model_serve`, `model_optimization_transfer`, `model_recipe_put`.
 
-⚠️ `model_serving` and `model_load` talk to a **cluster control API** (asmi) that is specific
-to the originating deployment. Without it they fail; search/get/family/transfer work standalone.
+⚠️ `model_serving` and `model_serve` talk to a **cluster control API** (asmi), and `model_load`
+to the **r1o web app**, both specific to the originating deployment. Without them they fail;
+search/get/family/transfer work standalone.
+
+`model_load(recipe_id, dry_run=True, node="", port=None)` asks r1o to serve a recipe:
+`POST <R1O_URL>/api/models/kb/recipes/<recipe_id>/serve {node?, port?}`. A single-machine recipe
+needs `node` (nothing picks a machine for you); a multi-machine recipe refuses one. r1o's answer
+comes back whole, including a refusal's `error` / `problems` / `fit`. r1o requires the operator's
+approval for every model launch and an MCP tool cannot carry one, so a live load returns
+`consent_required` with where to approve it (the r1o app's Topology → Recipes tab, or the r1o
+Agent's `serve_apply`). `dry_run` shows the request and calls nothing.
 
 ---
 
@@ -189,7 +198,9 @@ corpus describe your machines.
 |---|---|---|
 | Search returns nothing | index stale or corpus empty | `python3 build_bm25.py`; `kb-guard.py check` |
 | Corpus lost most records | the ordering trap fired | restore a `.bak-*`, rebuild via `pipeline.py` |
-| `model_load` / `model_serving` fail | need the cluster control API | expected standalone |
+| `model_load` / `model_serving` fail | need r1o / the cluster control API | expected standalone |
+| `model_load` returns `consent_required` | r1o asks the operator before every launch | start it from r1o (Topology → Recipes) or the r1o Agent |
+| Pipeline fails "holds no serve configs" | the recipe store is empty | write recipes with `model_recipe_put`; the previous generation was kept |
 | Ingest wrote nothing | upstream source path is wrong | check each ingest's input path |
 | Duplicate ids in verify | two ingests claiming one id | fix the id scheme upstream, re-ingest |
 

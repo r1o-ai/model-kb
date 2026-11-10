@@ -4,11 +4,12 @@
 Model-specific configs for the benchmarking agent / model-kb MCP are
 serve_recipe rows. Research notes alone do NOT count.
 
-Upstream SoT for recipes: ~/.r1o/serve-configs.json (via /serve-config skill).
+Upstream SoT for recipes: the recipe store (recipes.jsonl), written only through
+MCP model_recipe_put / `recipe_store.py put` on the writer node.
 NEVER hand-write records.jsonl.
 
 Gaps split:
-  missing_recipe  — weights exist on the cluster, no serve_recipe (fix via /serve-config)
+  missing_recipe  — weights exist on the cluster, no serve_recipe (fix via model_recipe_put)
   missing_weights — researched only (e.g. Muse Glimmer); do NOT invent a path/recipe
 
 Exit 1 only for missing_recipe. missing_weights is deferred (download first).
@@ -168,13 +169,18 @@ def _on_cluster(keys: set[str], cluster: set[str]) -> bool:
     return False
 
 
+# A hand-written recipe (authored_recipe, written through model_recipe_put) covers
+# its model exactly as a serve_recipe row does.
+RECIPE_KINDS = ("serve_recipe", "authored_recipe")
+
+
 def find_gaps(
     records: list[dict],
     *,
     require_hf_id: bool = False,
     index_db: Path | None = None,
 ) -> list[dict]:
-    recipes = [r for r in records if r.get("kind") == "serve_recipe"]
+    recipes = [r for r in records if r.get("kind") in RECIPE_KINDS]
     notes = [r for r in records if r.get("kind") == "research_note"]
     blobs = _recipe_blobs(recipes)
     cluster = _cluster_tokens(index_db or DEFAULT_INDEX_DB)
@@ -197,16 +203,16 @@ def find_gaps(
         if on_cluster:
             kind = "missing_recipe"
             fix = (
-                "Weights are on the cluster. Add a serve profile to "
-                "~/.r1o/serve-configs.json (use /serve-config) with the live path, "
-                "then run model-kb-ingest recipes in FULL ORDER "
-                "(recipes→cloud→research→family→hf→index). NEVER hand-edit records.jsonl."
+                "Weights are on the cluster. Write the recipe with MCP model_recipe_put "
+                "(model, engine, source, patch={\"configs\": {\"<recipe id>\": {model, serve, hardware}}}) "
+                "with the live path, on the writer node, then run pipeline.py (the full order: "
+                "recipes→cloud→research→family→hf→index). NEVER hand-edit records.jsonl."
             )
         else:
             kind = "missing_weights"
             fix = (
                 "Research-only — no matching artifact in graph-indexer model inventory. "
-                "Download first (live path), then add a serve-config. "
+                "Download first (live path), then write the recipe with model_recipe_put. "
                 "Do NOT invent ~/Models/<name> or a recipe without weights."
             )
         gaps.append(
@@ -235,7 +241,7 @@ def weights_without_recipe(records: list[dict], index_db: Path) -> list[dict]:
     """
     if not index_db.exists():
         return []
-    recipes = [r for r in records if r.get("kind") == "serve_recipe"]
+    recipes = [r for r in records if r.get("kind") in RECIPE_KINDS]
     norm = lambda s: re.sub(r"[^a-z0-9]+", "", (s or "").lower())
     covered: set[str] = set()
     for r in recipes:
@@ -284,7 +290,7 @@ def main() -> int:
         )
         return 2
     recs = _load(args.records)
-    n_recipes = sum(1 for r in recs if r.get("kind") == "serve_recipe")
+    n_recipes = sum(1 for r in recs if r.get("kind") in RECIPE_KINDS)
     n_notes = sum(1 for r in recs if r.get("kind") == "research_note")
     gaps = find_gaps(recs, require_hf_id=args.require_hf_id, index_db=args.index_db)
     missing_recipe = [g for g in gaps if g.get("kind") == "missing_recipe"]
@@ -321,7 +327,7 @@ def main() -> int:
             return 0
         if missing_recipe:
             print(
-                "\nMISSING RECIPE (weights on cluster — add serve-config, then ingest):\n"
+                "\nMISSING RECIPE (weights on cluster — write it with model_recipe_put, then run pipeline.py):\n"
             )
             for g in missing_recipe:
                 print(f"- {g['title']}")

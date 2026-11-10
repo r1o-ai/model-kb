@@ -34,19 +34,6 @@ REPO = ENGINE.parent
 LEGACY = "serve-configs" + ".json"
 RETIRED = ("ingest_" + "serve_configs", "fill_" + "recipe_paths")
 
-FX_CONFIGS = {
-    ("Fx-Model-4bit", "fx_engine"): {"fx-model-1node": {
-        "model": {"name": "Fx-Model-4bit", "hf_id": "fixture/Fx-Model"},
-        "serve": {"engine": "fx_engine", "backend": "single", "decode_concurrency": 2},
-        "sampling": {"temperature": 0.6},
-    }},
-    ("Fx-Gone-4bit", "fx_gone"): {"fx-gone-1node": {
-        "model": {"name": "Fx-Gone-4bit", "hf_id": "fixture/Fx-Gone"},
-        "serve": {"engine": "fx_gone", "backend": "single"},
-    }},
-}
-
-
 def _sources() -> list[Path]:
     return sorted(p for p in REPO.rglob("*.py") if "__pycache__" not in p.parts)
 
@@ -80,16 +67,12 @@ class TestGenerationsWithoutTheFile(KbCase):
     def legacy(self) -> Path:
         return self.home / ".r1o" / LEGACY
 
-    def seed_store(self) -> None:
-        for (model, engine), configs in FX_CONFIGS.items():
-            self.rs.put(self.kb, model=model, engine=engine, source="research", patch={"configs": configs})
-
     def recipes(self) -> dict[str, dict]:
         return {r["recipe_id"]: r for r in _read_jsonl(self.kb / "records.jsonl") if r.get("kind") == "serve_recipe"}
 
     def test_full_generation_builds_serve_recipes_from_the_store(self):
         self.assertFalse(self.legacy().exists())
-        self.seed_store()
+        self.seed_serve_configs()
         self.seed_research()
         _jsonl(self.kb / "records.jsonl", [])
 
@@ -106,7 +89,7 @@ class TestGenerationsWithoutTheFile(KbCase):
         self.assertFalse(self.legacy().exists(), "a generation must not create the retired file")
 
     def test_a_user_patch_to_one_key_of_a_config_overrides_the_researched_value(self):
-        self.seed_store()
+        self.seed_serve_configs()
         self.rs.put(self.kb, model="Fx-Model-4bit", engine="fx_engine", source="user",
                     patch={"configs": {"fx-model-1node": {"serve": {"decode_concurrency": 4}}}})
         self.seed_research()
@@ -119,7 +102,7 @@ class TestGenerationsWithoutTheFile(KbCase):
         self.assertEqual(serve["engine"], "fx_engine")
 
     def test_research_only_generation_verifies_without_the_file(self):
-        self.seed_store()
+        self.seed_serve_configs()
         self.seed_research()
         self.seed_hf_enrichments()
         _jsonl(self.kb / "records.jsonl", [])
@@ -136,7 +119,7 @@ class TestGenerationsWithoutTheFile(KbCase):
         self.assertFalse(self.legacy().exists())
 
     def test_a_leftover_file_is_neither_read_nor_rewritten(self):
-        self.seed_store()
+        self.seed_serve_configs()
         self.seed_research()
         _jsonl(self.kb / "records.jsonl", [])
         self.legacy().write_text(json.dumps({"configs": [{
@@ -171,7 +154,7 @@ class TestGenerationsWithoutTheFile(KbCase):
         self.assertEqual(sorted(self.recipes()), ["fx-kept-1node"])
 
     def test_recipe_notes_come_from_the_records(self):
-        self.seed_store()
+        self.seed_serve_configs()
         self.seed_research()
         _jsonl(self.kb / "records.jsonl", [])
         p = self.run_pipeline("--skip-network", "--skip-verify")

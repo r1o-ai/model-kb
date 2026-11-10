@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-11  
 **Status:** canonical for model-kb + asmi serve path  
-**Depends on:** asmi control plane, `~/.r1o/serve-configs.json` v3, qwen-bm25-hybrid, model-inventory, note-reader/wiki research  
+**Depends on:** asmi control plane, the recipe store `recipes.jsonl` (named serve configs, v3 shape; it replaced the hand-edited serve-config file 2026-11), qwen-bm25-hybrid, model-inventory, note-reader/wiki research  
 **ARDD plan (sources + multimodal + updates):** `~/.claude/docs/plans/2026-07-11-model-kb-ardd-plan.md`
 
 ## Problem
@@ -275,10 +275,11 @@ Which flag each field becomes is the engine record's: `GET /serve/engines` →
 rule for. A flag no record models goes in `extra_args` (or `params` for a
 record's `{param.KEY}` template, or `env`).
 
-**Not loadable, never guessed.** `ingest_serve_configs.py` sets `problems[]`,
+**Not loadable, never guessed.** `serve_recipes.py` sets `problems[]`,
 `warnings[]` and `loadable` on every recipe:
 
-- no `serve.engine` → `engine: null`, a problem; never a default engine;
+- no `serve.engine` → the engine the config's store record is filed under (the record key is
+  model × engine); a row built with no engine at all is `engine: null`, a problem; never a default engine;
 - `serve.extra_args` that is not a list of strings → dropped from the recipe
   (never split or coerced), a problem naming the value;
 - a value asmi would refuse for its type (e.g. a word in `prompt_cache_size`) →
@@ -491,7 +492,7 @@ carries `sha`/`lastModified`; an unchanged member is reused with no per-repo cal
 `/api/models/{id}` call (`cache: sha_match`). Gated/unreachable rows are re-checked
 every run.
 
-`serve.engine` is null when serve-configs omits it. Do not default `mlx_lm`.
+`serve.engine` is the config's own, else its store record's engine. Do not default `mlx_lm`.
 Joined recipe field is the summary (`component_drop_ids`, `gated_unauthenticated`,
 `relation_counts`), not the per-key maps.
 

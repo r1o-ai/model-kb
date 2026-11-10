@@ -5,9 +5,9 @@ End-to-end path:
   search "4bit dflash qwen 35b"
   get recipe:qwen35-35b-a3b-dflash-1node
   load <recipe_id> --dry-run
-  load <recipe_id>                 # POST asmi /serve/load
+  load <recipe_id> --node <machine>   # POST r1o /api/models/kb/recipes/<id>/serve (lib/r1o_serve.py)
 
-SoT: records.jsonl + bm25_index (from serve-configs). Live serving always asmi.
+SoT: records.jsonl + bm25_index (serve recipes from the recipe store). Live serving always asmi.
 """
 
 from __future__ import annotations
@@ -24,12 +24,13 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from build_bm25 import load_index, load_records, search as bm25_search  # noqa: E402
-from ingest_serve_configs import asmi_body_of, materialize_load  # noqa: E402
+from lib.r1o_serve import request_problems, serve_body, serve_recipe, serve_url  # noqa: E402
+from serve_recipes import asmi_body_of, materialize_load  # noqa: E402
 
 DEFAULT_RECORDS = ROOT / "records.jsonl"
 DEFAULT_INDEX = ROOT / "bm25_index" / "index.pkl"
 ASMI_URL = os.getenv("ASMI_URL", "http://127.0.0.1:9090")
-# Guarded load choke point (r1o web) — preferred over raw asmi.
+# r1o web: the recipe serve route (launch consent + fit + load guards) — the load path.
 R1O_URL = os.getenv("R1O_URL", "http://localhost:59408")
 
 
@@ -47,7 +48,7 @@ def _find_record(records: list[dict], recipe_id: str) -> dict | None:
 
 def cmd_search(args: argparse.Namespace) -> int:
     if not args.index.exists() or not args.records.exists():
-        print("missing index/records — run: python3 ingest_serve_configs.py && python3 build_bm25.py --rebuild", file=sys.stderr)
+        print("missing index/records — run: python3 pipeline.py", file=sys.stderr)
         return 1
     hits = None
     if getattr(args, "hybrid", False):
@@ -195,10 +196,10 @@ def cmd_load(args: argparse.Namespace) -> int:
     asmi_body = asmi_body_of(body)
     port = plan["port"]
     recipe_name = rec.get("recipe_id") or (rec.get("source") or {}).get("serve_config_name")
-    # Only explicit --direct bypasses the r1o guarded apply path.
-    # --port alone is recorded on the body for dry-run / direct tests, but
-    # live loads without --direct always go through guardedServeLoad.
+    # Only explicit --direct skips r1o. Without it the load is r1o's recipe
+    # serve route, sent once to the machine --node names (never a guessed one).
     use_direct = bool(getattr(args, "direct", False))
+    node = getattr(args, "node", None)
 
     result = {
         "recipe_id": recipe_name,
@@ -207,21 +208,26 @@ def cmd_load(args: argparse.Namespace) -> int:
         "warnings": plan["warnings"],
         "serve_keys_not_sent": plan["not_sent"],
         "dry_run": bool(args.dry_run),
-        "via": "dry-run" if args.dry_run else ("asmi-direct" if use_direct else "r1o-guarded-apply"),
+        "via": "dry-run" if args.dry_run else ("asmi-direct" if use_direct else "r1o-recipe-serve"),
     }
+    if not use_direct:
+        result["serve_url"] = serve_url(R1O_URL, recipe_name)
+        result["request"] = serve_body(node, args.port)
+        would_refuse = request_problems(rec, node)
+        if would_refuse:
+            result["request_problems"] = would_refuse
 
     if args.dry_run:
         mp = str(asmi_body.get("model_path") or "")
         expanded = Path.home() / mp[2:] if mp.startswith("~/") else Path(mp).expanduser()
         result["model_path_exists"] = expanded.exists()
         result["model_path_resolved"] = str(expanded)
-        result["guarded_apply_url"] = f"{R1O_URL}/api/agent/serve-configs/{recipe_name}/apply"
         result["ok"] = True
         result["note"] = "dry-run only — no load call"
         print(json.dumps(result, indent=2, default=str))
         return 0
 
-    # Live load: prefer r1o apply (guardedServeLoad). Only --direct → raw asmi.
+    # Live load: r1o's recipe serve route. Only --direct → raw asmi on this node.
     if use_direct:
         # asmi selects the slot via ?port= (daemon.rs); without one it uses the
         # engine record's default port — model-kb never guesses a number.
@@ -231,45 +237,20 @@ def cmd_load(args: argparse.Namespace) -> int:
         result["http_status"] = code
         result["asmi"] = data
         result["ok"] = code in (200, 201)
+        sc, status = _asmi_json("GET", "/serve/status", timeout=5)
+        result["serve_status_http"] = sc
+        if isinstance(status, dict):
+            match = [s for s in (status.get("servers") or []) if s.get("port") == port]
+            result["port_status"] = match[0] if match else None
     else:
-        url = f"{R1O_URL.rstrip('/')}/api/agent/serve-configs/{recipe_name}/apply"
-        result["apply_url"] = url
-        # Optional port override still goes through guardedServeLoad.
-        apply_payload: dict = {}
-        if args.port is not None:
-            apply_payload["port"] = int(args.port)
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(apply_payload).encode(),
-            method="POST",
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=float(args.timeout)) as resp:
-                raw = resp.read().decode()
-                code = resp.status
-                try:
-                    data = json.loads(raw) if raw else {}
-                except json.JSONDecodeError:
-                    data = raw
-        except urllib.error.HTTPError as e:
-            code = e.code
-            raw = e.read().decode() if e.fp else str(e)
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                data = raw
-        except Exception as e:  # noqa: BLE001
-            code, data = 0, str(e)
-        result["http_status"] = code
-        result["apply"] = data
-        result["ok"] = code in (200, 201) and isinstance(data, dict) and data.get("ok") is True
+        # r1o's answer, whole: a refusal keeps its error / problems / fit, and a
+        # launch-approval refusal says where the operator can approve it.
+        result.update(serve_recipe(R1O_URL, recipe_name, node=node, port=args.port, timeout=float(args.timeout)))
+        if result.get("error"):
+            print(result["error"], file=sys.stderr)
+            for line in result.get("approve") or []:
+                print(f"  - {line}", file=sys.stderr)
 
-    sc, status = _asmi_json("GET", "/serve/status", timeout=5)
-    result["serve_status_http"] = sc
-    if isinstance(status, dict):
-        match = [s for s in (status.get("servers") or []) if s.get("port") == port]
-        result["port_status"] = match[0] if match else None
     print(json.dumps(result, indent=2, default=str))
     return 0 if result.get("ok") else 1
 
@@ -295,20 +276,26 @@ def main() -> int:
 
     p_l = sub.add_parser(
         "load",
-        help="Load recipe via r1o guarded apply (default) or asmi --direct",
+        help="Serve a recipe on a machine via r1o's recipe serve route (default) or asmi --direct",
     )
     p_l.add_argument("recipe_id")
     p_l.add_argument("--dry-run", action="store_true")
     p_l.add_argument(
         "--direct",
         action="store_true",
-        help="POST asmi /serve/load directly (bypasses r1o guard)",
+        help="POST this node's asmi /serve/load directly (skips r1o: no launch consent, no fit check)",
+    )
+    p_l.add_argument(
+        "--node",
+        default=None,
+        help="Machine to serve on. Required for a single-machine recipe (r1o never picks one); "
+             "refused for a multi-machine recipe, which loads on the r1o coordinator",
     )
     p_l.add_argument(
         "--port",
         type=int,
         default=None,
-        help="Override port on asmi body (dry-run always; live only with --direct)",
+        help="Override the recipe's serve.port (sent to r1o as port; with --direct it is asmi's ?port=)",
     )
     p_l.add_argument("--hostfile", default=None)
     p_l.add_argument("--timeout", type=float, default=180.0)

@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from build_bm25 import load_index, load_records, search  # noqa: E402
-from ingest_serve_configs import materialize_load, normalize_quant  # noqa: E402
+from serve_recipes import materialize_load, normalize_quant  # noqa: E402
 
 
 def _load_yaml(path: Path) -> dict:
@@ -193,7 +193,7 @@ def main() -> int:
         print(f"FAIL missing {args.yaml}")
         return 1
     if not args.records.exists():
-        print(f"FAIL missing {args.records}; run ingest_serve_configs.py")
+        print(f"FAIL missing {args.records}; run pipeline.py")
         return 1
     if not args.index.exists():
         print(f"FAIL missing {args.index}; run build_bm25.py --rebuild")

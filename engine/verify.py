@@ -2,8 +2,9 @@
 """verify.py — post-ingest health gate for model-kb.
 
 Fails closed if a kind is zeroed (join trap), a recipe has no engine or was not
-folded (no computed servability), a serve config's field did not reach its
-recipe unexplained (the asmi round trip), embeddings are misaligned, or
+folded (no computed servability), a field of a serve config in the recipe store
+did not reach its recipe unexplained (the asmi round trip), embeddings are
+misaligned, or
 recipe_gap reports missing_recipe. A recipe whose engine no online node declares
 is NOT a failure: the fold marks it servable=false with a reason, and it is
 listed here. So is a recipe that cannot load as recorded (`problems`).
@@ -26,8 +27,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from ingest_serve_configs import DEFAULT_CONFIG as DEFAULT_SERVE_CONFIGS  # noqa: E402 — the recipes' upstream
 from lib.asmi_load import LOAD_REQUEST_FIELDS  # noqa: E402
+from serve_recipes import store_configs  # noqa: E402 — the recipes' upstream: the recipe store
 
 
 def load_records(path: Path) -> list[dict]:
@@ -112,11 +113,21 @@ def classify_key(key: str, engine_fields: set[str]) -> str:
     return "config-only (not an asmi field)"
 
 
-def check_round_trip(recipes: list[dict], config_path: Path) -> int:
-    if not config_path.exists():
-        print(f"FAIL: serve configs missing at {config_path} — cannot check the asmi round trip")
+def check_round_trip(recipes: list[dict], root: Path) -> int:
+    """`root` is the model-kb dir whose recipe store (recipes.jsonl) the recipes were built from."""
+    if not (root / "recipes.jsonl").exists():
+        print(f"serve round trip: no recipe store at {root / 'recipes.jsonl'} — skipped "
+              "(a seed corpus has no upstream to compare)")
+        return 0
+    try:
+        configs = store_configs(root)
+    except ValueError as e:
+        print(f"FAIL: recipe store unreadable: {e} — cannot check the asmi round trip")
         return 1
-    configs = list(json.loads(config_path.read_text()).get("configs") or [])
+    if not configs:
+        print(f"FAIL: the recipe store at {root / 'recipes.jsonl'} holds no serve configs — "
+              "cannot check the asmi round trip")
+        return 1
     rt = serve_round_trip(recipes, configs)
     print(f"serve round trip: configs={len(configs)} dropped={len(rt['dropped'])} "
           f"changed={len(rt['changed'])} unmatched={len(rt['unmatched'])}")
@@ -134,7 +145,7 @@ def check_round_trip(recipes: list[dict], config_path: Path) -> int:
     for row in rt["unexplained"]:
         print(f"  LOST serve.{row['key']} ({row['kind']}, {classify_key(row['key'], engine_fields)}) "
               f"in {row['recipe']}")
-    print("FAIL: serve config fields did not reach their recipes — fix ingest, never the corpus")
+    print("FAIL: serve config fields did not reach their recipes — fix serve_recipes.py, never the corpus")
     return 1
 
 
@@ -144,7 +155,7 @@ def verify(
     skip_embed: bool = False,
     skip_gaps: bool = False,
     strict_gated: bool = False,
-    serve_configs: Path | None = DEFAULT_SERVE_CONFIGS,
+    recipe_root: Path | None = ROOT,
 ) -> int:
     recs = load_records(records_path)
     kinds = collections.Counter(r.get("kind") for r in recs)
@@ -189,7 +200,7 @@ def verify(
     print(f"loadable: {sum(1 for r in recipes if r.get('loadable') is not False)}  not loadable: {len(not_loadable)}")
     for rid, problems in not_loadable:
         print(f"  NOT LOADABLE {rid}: " + "; ".join(problems or []))
-    if serve_configs is not None and check_round_trip(recipes, serve_configs):
+    if recipe_root is not None and check_round_trip(recipes, recipe_root):
         return 1
 
     if not skip_gaps:
@@ -267,8 +278,8 @@ def main() -> int:
     ap.add_argument("--skip-embed", action="store_true")
     ap.add_argument("--skip-gaps", action="store_true")
     ap.add_argument("--strict-gated", action="store_true")
-    ap.add_argument("--serve-configs", type=Path, default=DEFAULT_SERVE_CONFIGS,
-                    help="serve configs the recipes were ingested from (asmi round trip)")
+    ap.add_argument("--recipe-root", type=Path, default=ROOT,
+                    help="model-kb dir whose recipe store the recipes were built from (asmi round trip)")
     ap.add_argument("--skip-round-trip", action="store_true")
     args = ap.parse_args()
     if not args.records.exists():
@@ -279,7 +290,7 @@ def main() -> int:
         skip_embed=args.skip_embed,
         skip_gaps=args.skip_gaps,
         strict_gated=args.strict_gated,
-        serve_configs=None if args.skip_round_trip else args.serve_configs,
+        recipe_root=None if args.skip_round_trip else args.recipe_root,
     )
 
 

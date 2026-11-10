@@ -4,12 +4,15 @@
 Store:     <root>/recipes.jsonl — one record per (model, engine, source),
            source ∈ research | benchmark | user, each with a history[] of patches.
            The only hand-made data in model-kb; records.jsonl is regenerated.
+           A record's `configs` are its named serve configs: serve_recipes.py
+           turns each one into a serve_recipe row (the name is the recipe id).
 Snapshot:  <root>/recipes.snapshot.json — GENERATED, 0444, a pure function of the
            store. The chat path reads only this file, so a model-kb outage cannot
            stop chat. Never edit it; the guard rejects writes to it.
 Fold:      pipeline.py calls fold_into_records() under its lock on every
            generation. It re-adds the store as kind=authored_recipe rows (so they
-           survive the recipes clobber) and computes servable / servable_on /
+           survive the recipes clobber; a row names its serve configs, it does
+           not repeat them) and computes servable / servable_on /
            servable_reason for every recipe row from the live engine union.
 
 Writes happen only on the writer node: the node whose crontab runs this
@@ -59,7 +62,7 @@ _ENGINE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
 _PATH_TOKEN = re.compile(r"[^\s'\"]+")
 __all__ = [
     "EXIT_LOCKED", "EXIT_NOT_WRITER", "EXIT_NO_ENGINES", "EngineCatalogUnavailable",
-    "LockHeld", "NotWriterNode", "RecipeError", "export_recipe_snapshot", "fold_into_records",
+    "LockHeld", "NotWriterNode", "RecipeError", "effective_recipes", "export_recipe_snapshot", "fold_into_records",
     "get", "is_writer_node", "put",
 ]
 
@@ -278,6 +281,12 @@ def snapshot_doc(rows: list[dict[str, Any]], store_sha256: str) -> dict[str, Any
     }
 
 
+def effective_recipes(root: Path = ROOT) -> list[dict[str, Any]]:
+    """The store per (model, engine): {model, engine, sources, effective}, with the
+    sources merged research < benchmark < user — the snapshot's `recipes`."""
+    return snapshot_doc(_load_store(root), "")["recipes"]
+
+
 def export_recipe_snapshot(root: Path = ROOT, rows: list[dict[str, Any]] | None = None) -> Path:
     """Write recipes.snapshot.json (0444) from the store. Same store → same bytes."""
     root = Path(root)
@@ -306,18 +315,37 @@ def _servability(engine: Any, engines: dict[str, list[str]]) -> dict[str, Any]:
 
 
 def _authored_row(r: dict[str, Any]) -> dict[str, Any]:
-    recipe = r.get("recipe") or {}
+    recipe = dict(r.get("recipe") or {})
     model, engine, source = _key(r)
-    return {
+    # Each named serve config is its own serve_recipe row (serve_recipes.py), so
+    # this row names them instead of repeating their bodies.
+    configs = recipe.pop("configs", None)
+    names = sorted(configs) if isinstance(configs, dict) else []
+    # The row reads back like a serve_recipe row: the record is filed (model,
+    # engine), so those are its facts, and its serve knobs ride along. Without
+    # this a hand-written recipe (the only way to add one now) could not be
+    # materialized into a load.
+    artifact = dict(recipe.get("artifact") or {})
+    artifact.setdefault("name", model)
+    row = {
         "id": f"authored:{source}:{model}@{engine}",
+        "artifact": artifact,
+        "quant": recipe.get("quant"),
+        "serve": {"engine": engine, **(recipe.get("serve") or {})},
+        "hardware": recipe.get("hardware"),
+        "accelerators": recipe.get("accelerators") or [],
+        "benchmarks": recipe.get("benchmarks") or [],
         "kind": AUTHORED_KIND,
         "model": model,
         "engine": engine,
         "source": source,
         "recipe": recipe,
         "updated": r.get("updated"),
-        "search_text": f"{model} {engine} {source} recipe {json.dumps(recipe, sort_keys=True)}",
+        "search_text": " ".join([f"{model} {engine} {source} recipe {json.dumps(recipe, sort_keys=True)}", *names]),
     }
+    if names:
+        row["serve_configs"] = names
+    return row
 
 
 def fold_into_records(
