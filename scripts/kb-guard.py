@@ -3,7 +3,7 @@
 
 THE ORDERING TRAP
 -----------------
-`ingest_serve_configs.py` opens records.jsonl with mode "w" — it writes ONLY
+`serve_recipes.py` opens records.jsonl with mode "w" — it writes ONLY
 serve_recipe rows. Every cloud_context, research_note, hf_family and hf_card record
 is destroyed. There is no warning, no diff, and no non-zero exit: the run looks like
 a success and the corpus silently loses most of its content.
@@ -41,7 +41,7 @@ from pathlib import Path
 
 # Only this script targets records.jsonl with open("w"). The hf_* scripts also use
 # "w" but write to their OWN enrichments_*.jsonl, so they are not corpus-destructive.
-CLOBBERS_CORPUS = {"recipes": "ingest_serve_configs.py"}
+CLOBBERS_CORPUS = {"recipes": "serve_recipes.py"}
 CLOBBER_KEEPS = {"serve_recipe"}
 
 

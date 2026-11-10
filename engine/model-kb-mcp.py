@@ -5,7 +5,7 @@ Tools:
   model_search   — BM25 over recipes (quant, accel, engine, t/s tokens)
   model_get      — full recipe + ServeRequest materialization
   model_serving  — live asmi /serve/status (never from KB)
-  model_load     — load recipe via r1o guarded apply (or dry_run)
+  model_load     — serve a recipe on a named machine via r1o's recipe serve route (or dry_run)
   model_serve    — reap stale servers, pick best recipe, asmi /serve/load, reap leftovers
   model_recipe_put — write a (model, engine, source) recipe record (writer node only)
 
@@ -30,7 +30,8 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from build_bm25 import load_index, load_records, search as bm25_search  # noqa: E402
-from ingest_serve_configs import asmi_body_of, materialize_load, recipe_to_serve_request  # noqa: E402
+from lib.r1o_serve import request_problems, serve_body, serve_recipe, serve_url  # noqa: E402
+from serve_recipes import asmi_body_of, materialize_load, recipe_to_serve_request  # noqa: E402
 
 mcp = FastMCP("model-kb")
 
@@ -250,7 +251,7 @@ def model_search(query: str, top_k: int = 8, hybrid: bool = True) -> dict:
     Falls back to BM25-only with a `note` if vectors/server unavailable.
     """
     if not INDEX.exists() or not RECORDS.exists():
-        return {"error": "index missing — run ingest_serve_configs.py && build_bm25.py --rebuild"}
+        return {"error": "index missing — run pipeline.py"}
     if hybrid:
         try:
             from hybrid_search import HybridModelKb
@@ -434,11 +435,23 @@ def model_serving() -> dict:
 
 
 @mcp.tool()
-def model_load(recipe_id: str, dry_run: bool = True) -> dict:
-    """Load a recipe via r1o guarded apply route (guardedServeLoad).
+def model_load(recipe_id: str, dry_run: bool = True, node: str = "", port: int | None = None) -> dict:
+    """Serve a recipe on a machine through r1o's recipe serve route.
 
-    dry_run=True (default) only materializes + checks model_path exists.
-    dry_run=False POSTs /api/agent/serve-configs/{name}/apply.
+    dry_run=True (default) only materializes the load, checks model_path on this
+    node and shows the request that would be sent. Nothing is called.
+    dry_run=False POSTs /api/models/kb/recipes/{recipe_id}/serve {node?, port?} once.
+
+    node: the machine to serve on. Required for a single-machine recipe: r1o
+          never picks one and neither does this tool. A multi-machine recipe
+          loads on the r1o coordinator with its hostfile and refuses a node.
+    port: optional override of the recipe's serve.port.
+
+    The answer is r1o's. A refusal returns ok=false with r1o's `error` and, when
+    it sent them, `problems` / `fit` / `engine_required`; it is never retried on
+    another machine. r1o requires the operator's approval for every launch and
+    this tool cannot carry one, so a live load comes back `consent_required`
+    with `approve` (where the operator can start the same launch).
     """
     records = load_records(RECORDS)
     rec = _find(records, recipe_id)
@@ -461,35 +474,25 @@ def model_load(recipe_id: str, dry_run: bool = True) -> dict:
     out = {
         "recipe_id": name,
         "asmi_body": asmi_body,
-        "port": plan["port"],
+        "port": plan["port"] if port is None else int(port),
         "warnings": plan["warnings"],
         "serve_keys_not_sent": plan["not_sent"],
         "model_path_exists": expanded.exists(),
         "model_path_resolved": str(expanded),
-        "via": "dry-run" if dry_run else "r1o-guarded-apply",
-        "apply_url": f"{R1O_URL.rstrip('/')}/api/agent/serve-configs/{name}/apply",
+        "via": "dry-run" if dry_run else "r1o-recipe-serve",
+        "serve_url": serve_url(R1O_URL, name),
+        "request": serve_body(node, port),
     }
+    would_refuse = request_problems(rec, node)
+    if would_refuse:
+        out["request_problems"] = would_refuse
 
     if dry_run:
         out["ok"] = True
         out["note"] = "dry-run — no load"
         return out
 
-    code, data = _http_json(
-        "POST",
-        out["apply_url"],
-        {},
-        timeout=180,
-    )
-    out["http_status"] = code
-    out["apply"] = data
-    out["ok"] = code in (200, 201) and isinstance(data, dict) and data.get("ok") is True
-    sc, status = _http_json("GET", f"{ASMI_URL.rstrip('/')}/serve/status", timeout=5)
-    out["serve_status_http"] = sc
-    if isinstance(status, dict):
-        port = plan["port"]
-        match = [s for s in (status.get("servers") or []) if s.get("port") == port]
-        out["port_status"] = match[0] if match else None
+    out.update(serve_recipe(R1O_URL, name, node=node, port=port, timeout=180))
     return out
 
 
@@ -510,7 +513,7 @@ def model_serve(query: str, dry_run: bool = False) -> dict:
             "ok": False,
             "error": f"no serve_recipe matching {query!r}",
             "kind": "missing_recipe_or_weights",
-            "hint": "A research note is not a config. Add weights + a serve-config, then ingest.",
+            "hint": "A research note is not a recipe. Add weights, write the recipe with model_recipe_put, then run pipeline.py.",
         }
 
     plan = materialize_load(rec, hostfile=str(DEFAULT_HOSTFILE))

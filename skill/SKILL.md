@@ -16,7 +16,7 @@ It is a DERIVED store. Every record traces back to an upstream source of truth:
 
 | Record kind | Count* | Upstream SoT | Ingest script |
 |---|---|---|---|
-| `serve_recipe` | 43 | `~/.r1o/serve-configs.json` | `ingest_serve_configs.py` |
+| `serve_recipe` | 43 | the recipe store `recipes.jsonl` (`model_recipe_put`) | `serve_recipes.py` |
 | `cloud_context` | 245 | CLIProxy / provider APIs | `ingest_cloud_context.py` |
 | `research_note` | 73 | `~/wiki/atlas/**` | `ingest_research.py` |
 | `hf_family` | 19 | HF Hub `base_model` tree | `ingest_hf_family.py` |
@@ -30,7 +30,7 @@ A hand-edited record is silently destroyed by the next `recipes` run.
 
 ## ⛔ THE ORDERING TRAP — read before running anything
 
-`ingest_serve_configs.py` **CLOBBERS** `records.jsonl` (`open("w")`, recipes only).
+`serve_recipes.py` **CLOBBERS** `records.jsonl` (`open("w")`, recipes only).
 `ingest_cloud_context.py` and `ingest_vendor_research.py` **MERGE** (read → merge → write).
 
 So running `recipes` on a populated corpus destroys all 245 `cloud_context` +
@@ -69,16 +69,19 @@ that was the explicit goal. A drop is the ordering trap firing.
 
 ## Modes
 
-### `recipes` — serve recipes from serve-configs.json
+### `recipes` — serve recipes from the recipe store
 The advisor's measured data (benchmarks, accelerators, known_issues) comes from here.
+Each named config under a store record's `configs` is one `serve_recipe` row.
 
 ```bash
 cd ~/infra/model-kb
-python3 ingest_serve_configs.py            # --config / --out to override
+python3 serve_recipes.py                   # --root / --out to override
 ```
 ⛔ CLOBBERS. Must be followed by `cloud` (and any other kinds you need) + `index`.
+An empty or unreadable store exits 1 and writes nothing.
 
-Fix data problems in `~/.r1o/serve-configs.json` (use the `/serve-config` skill), not here.
+Fix data problems in the store with MCP `model_recipe_put` (or `recipe_store.py put`) on the
+writer node, e.g. `patch={"configs": {"<recipe id>": {"serve": {"engine": "…"}}}}`, not here.
 
 ### `cloud` — cloud model contexts (merge-safe)
 ```bash
@@ -179,7 +182,7 @@ server, not the web panel. Rebuild anyway to keep the two consistent.
 ```bash
 cd ~/infra/model-kb
 cp records.jsonl "records.jsonl.bak-$(date +%Y%m%d-%H%M%S)"
-python3 ingest_serve_configs.py \
+python3 serve_recipes.py \
   && python3 ingest_cloud_context.py \
   && python3 ingest_research.py \
   && python3 ingest_hf_family.py \
@@ -243,8 +246,8 @@ Found by the r1o advisor's `serve_command` materializer across all 43 recipes:
 
 | Problem | Recipes | Fix |
 |---|---|---|
-| `engine: "dflash-mlx"` not in the engine registry (registry has `dflash`) | `kimi-k26-dflash-1node`, `kimi-k26-dflash-4node` | Rename the engine in `~/.r1o/serve-configs.json`, re-ingest `recipes` |
-| No explicit `artifact.path` — falls back to `~/Models/<name>` | 31 of 43 | Add `model.path` to the serve-config where the real path differs |
+| `engine: "dflash-mlx"` not in the engine registry (registry has `dflash`) | `kimi-k26-dflash-1node`, `kimi-k26-dflash-4node` | Fix `serve.engine` with `model_recipe_put`, re-run `recipes` |
+| No explicit `artifact.path` — falls back to `~/Models/<name>` | 31 of 43 | Add `model.path` with `model_recipe_put` where the real path differs |
 | `benchmarks[]` empty | 30 of 43 | Run the benchmark on the Benchmarks page, save the profile, re-ingest |
 | `optimization_transfer` never precomputed | 43 of 43 | Expected — the advisor derives transfer live |
 
@@ -262,7 +265,7 @@ guessing `mlx_lm` for a GGUF model dies on a bare mmap EINVAL). Fix upstream.
 The web side re-reads on mtime change — no restart needed after ingest.
 
 <final-rules>
-- NEVER run `ingest_serve_configs.py` on a populated corpus without following it with `cloud` (+ the other kinds) and comparing counts to the baseline.
+- NEVER run `serve_recipes.py` on a populated corpus without following it with `cloud` (+ the other kinds) and comparing counts to the baseline.
 - NEVER hand-edit `records.jsonl` — fix the upstream SoT and re-ingest.
 - ALWAYS back up before a write mode, and ALWAYS run `verify` after.
 - ALWAYS rebuild the BM25 index after a records change.

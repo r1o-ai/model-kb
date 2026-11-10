@@ -105,7 +105,7 @@ class McpServerNames(unittest.TestCase):
 
     def test_detector_catches_the_2026_10_31_regression(self):
         src = (
-            "from ingest_serve_configs import asmi_body_of\n"
+            "from serve_recipes import asmi_body_of\n"
             "def model_get(rec):\n"
             "    return recipe_to_serve_request(rec)\n"
         )

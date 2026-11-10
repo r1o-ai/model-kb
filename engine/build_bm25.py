@@ -115,7 +115,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if not args.records.exists():
-        print(f"missing {args.records}; run ingest_serve_configs.py first")
+        print(f"missing {args.records}; run pipeline.py first")
         return 1
 
     if args.rebuild or not args.index.exists() or args.query is None:

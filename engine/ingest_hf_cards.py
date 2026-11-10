@@ -7,7 +7,7 @@ Pulls what Unsloth (and HF cards) actually publish for serve decisions:
   - GGUF quant inventory + sizes when present
   - Dynamic/imatrix/KLD marketing signals (searchable claims)
 
-Does NOT invent t/s — local tok/s stay in recipe.benchmarks from serve-configs.
+Does NOT invent t/s — local tok/s stay in recipe.benchmarks from the recipe store.
 Community quality scores inform *which quant/family to prefer*; local benches
 inform *how we run it*.
 

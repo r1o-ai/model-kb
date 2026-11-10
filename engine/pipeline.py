@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """pipeline.py — canonical full rebuild for model-kb.
 
-Order is load-bearing (ingest_serve_configs.py clobbers records.jsonl):
+Order is load-bearing (serve_recipes.py replaces records.jsonl with the serve
+recipes it builds from the recipe store; every later step merges):
 
-  lock → embed preflight → snapshot → backup → fill-paths → recipes → cloud
+  lock → embed preflight → snapshot → backup → recipes → cloud
   → research → family → derivative → hf cards → merge enrichments → join
   → transfer → fold authored recipes → BM25 → embed → verify
+
+Serve recipes come only from the recipe store (recipes.jsonl; recipe_store.py /
+MCP model_recipe_put). No step reads or writes a file outside this directory's
+own inputs; an empty store fails the recipes step and the previous generation
+is kept.
 
 Usage:
   python3 pipeline.py                 # full, fail closed
   python3 pipeline.py --release       # same + fatal network + seed export
   python3 pipeline.py --allow-partial # network failures become warnings (embed never does)
   python3 pipeline.py --research-only # research → merge → join → fold → BM25 → embed → verify (no recipes clobber)
-  python3 pipeline.py --skip-embed --skip-fill-paths
+  python3 pipeline.py --skip-embed
 
 Records and vectors are one generation. records.jsonl rows must equal
 vectors.npy rows and vectors.ids.json (verify.py; hybrid search falls back to
@@ -149,7 +155,8 @@ def main() -> int:
     ap.add_argument("--allow-partial", action="store_true", help="Network failures are warnings (embed stays fatal)")
     ap.add_argument("--research-only", action="store_true",
                     help="research → merge → join → BM25 → embed → verify; keeps recipes + existing HF enrichments")
-    ap.add_argument("--skip-fill-paths", action="store_true")
+    ap.add_argument("--skip-fill-paths", action="store_true",
+                    help="Accepted and ignored: the fill-paths step is retired (existing job lines still pass it)")
     ap.add_argument("--skip-research", action="store_true")
     ap.add_argument("--skip-network", action="store_true", help="Skip cloud/family/hf (keep existing enrichments)")
     ap.add_argument("--skip-embed", action="store_true")
@@ -161,7 +168,6 @@ def main() -> int:
     if args.research_only:
         if args.skip_research:
             ap.error("--research-only and --skip-research contradict")
-        args.skip_fill_paths = True
         args.skip_network = True
 
     records = ROOT / "records.jsonl"
@@ -188,12 +194,10 @@ def main() -> int:
     bak = backup(records)
     complete = False
     try:
-        if not args.skip_fill_paths:
-            run("fill_recipe_paths.py")
-
-        # 1) recipes CLOBBERS — must be first
+        # 1) recipes CLOBBERS — must be first. Built from the recipe store; an
+        #    empty or unreadable store fails here and the generation is restored.
         if not args.research_only:
-            run("ingest_serve_configs.py", "--out", str(records))
+            run("serve_recipes.py", "--out", str(records))
 
         # 2) cloud merge
         if not args.skip_network:

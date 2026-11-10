@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
-"""ingest_serve_configs.py — serve-configs.json v3 → L0 recipe records.
+"""serve_recipes.py — the recipe store's named serve configs → serve_recipe records.
 
-Phase B task 6 of model-kb ARDD plan (2026-07-11).
-SoT: ~/.r1o/serve-configs.json (never invent profiles).
-Output: records.jsonl (append-safe via rewrite of recipe:* rows only when run standalone).
+SoT: recipes.jsonl, the recipe store (recipe_store.py is its one writer; MCP
+model_recipe_put). A (model, engine) record holds its named serve configs:
+
+    model_recipe_put(model, engine, source,
+                     {"configs": {"<recipe id>": {"model": …, "serve": …, "hardware": …}}})
+
+Each named config is one serve_recipe row, and its name is the recipe id.
+Sources merge research < benchmark < user, so a user patch to one key of a
+config overrides the researched value. Nothing here reads a file outside the
+model-kb dir.
+
+Output: records.jsonl, REPLACED with the serve_recipe rows only (pipeline.py
+runs this first; every later step merges). An unreadable store, or one that
+holds no serve config, is a failure with its reason and nothing is written.
 
 The `serve` section is carried whole, under its own names: asmi's
 `POST /serve/load` is the contract (lib/asmi_load.py), so every asmi field a
 config sets reaches the recipe and the load unchanged. Nothing here picks a
-subset, and nothing defaults an engine: a config without one gives a recipe
-that is not loadable, with the reason in `problems`.
+subset, and nothing guesses an engine: a config that names none takes the
+engine its store record is filed under.
 
 Usage:
-  python3 ingest_serve_configs.py
-  python3 ingest_serve_configs.py --out records.jsonl
+  python3 serve_recipes.py
+  python3 serve_recipes.py --root <model-kb dir> --out records.jsonl
 """
 
 from __future__ import annotations
@@ -31,8 +42,6 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from lib.asmi_load import asmi_body_of, describe_type, serve_load_fields, type_ok  # noqa: E402
-DEFAULT_CONFIG = Path.home() / ".r1o" / "serve-configs.json"
-DEFAULT_OUT = ROOT / "records.jsonl"
 
 # Quant vocabulary (schema §Quant vocabulary)
 # Order matters: decimal-bit/bpw BEFORE integer Nbit so "3.6bit" ≠ "6bit".
@@ -434,22 +443,65 @@ def recipe_to_serve_request(rec: dict[str, Any], hostfile: str | None = None) ->
     return req
 
 
-def load_configs(path: Path) -> list[dict[str, Any]]:
-    data = json.loads(path.read_text())
-    return list(data.get("configs") or [])
+def store_configs(root: Path = ROOT) -> list[dict[str, Any]]:
+    """Every named serve config in the recipe store, as {"name": <recipe id>, …config}.
+
+    Read from each (model, engine) record's `configs`, with the sources merged
+    research < benchmark < user. A config that names no model or engine takes
+    the ones its record is filed under. Raises recipe_store.RecipeError (a
+    ValueError) when the store is unreadable, `configs` is not an object of
+    objects, or two records define the same name — a recipe id names one config.
+    """
+    import recipe_store  # noqa: PLC0415 — materialize_load (the load path) must import without the store
+
+    out: list[dict[str, Any]] = []
+    owner: dict[str, str] = {}
+    for entry in recipe_store.effective_recipes(root):
+        where = f"{entry['model']} @ {entry['engine']}"
+        configs = entry["effective"].get("configs")
+        if configs is None:
+            continue
+        if not isinstance(configs, dict):
+            raise recipe_store.RecipeError(
+                f"{where}: recipe.configs must be an object of named serve configs (got {type(configs).__name__})")
+        for name, cfg in configs.items():
+            if not isinstance(cfg, dict):
+                raise recipe_store.RecipeError(
+                    f"{where}: serve config {name!r} must be an object (got {type(cfg).__name__})")
+            if name in owner:
+                raise recipe_store.RecipeError(
+                    f"serve config {name!r} is defined by both {owner[name]} and {where}; a recipe id names one config")
+            owner[name] = where
+            c = copy.deepcopy(cfg)
+            c["name"] = name
+            for section, key, filed_under in (("model", "name", entry["model"]), ("serve", "engine", entry["engine"])):
+                c[section] = dict(c.get(section) or {})
+                c[section].setdefault(key, filed_under)
+            out.append(c)
+    return out
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    ap.add_argument("--root", type=Path, default=ROOT, help="model-kb dir that holds recipes.jsonl")
+    ap.add_argument("--out", type=Path, default=None, help="default: <root>/records.jsonl")
     args = ap.parse_args()
+    out_path = args.out or args.root / "records.jsonl"
 
-    if not args.config.exists():
-        print(f"missing {args.config}")
+    try:
+        configs = store_configs(args.root)
+    except ValueError as e:
+        print(f"FAIL: recipe store unreadable: {e} — nothing written")
+        return 1
+    if not configs:
+        print(
+            f"FAIL: the recipe store at {args.root / 'recipes.jsonl'} holds no serve configs — nothing written. "
+            "Serve recipes are store records with recipe.configs: add one with MCP model_recipe_put / "
+            "`recipe_store.py put` on the writer node, or seed the store from the retired serve-config "
+            "file with r1o scripts/retire/31-serve-configs-g.py."
+        )
         return 1
 
-    configs = load_configs(args.config)
     records = [recipe_from_config(c) for c in configs]
 
     # backend ban unit check (an unloadable recipe is recorded, not fatal)
@@ -459,12 +511,12 @@ def main() -> int:
         plan = materialize_load(r, hostfile="~/.r1o/hostfiles/default.json" if b == "jaccl" else None)
         assert plan["asmi_body"]["backend"] != "auto"
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    with args.out.open("w") as f:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w") as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    print(f"wrote {len(records)} recipes → {args.out}")
+    print(f"wrote {len(records)} recipes → {out_path}")
     # sample stats
     dflash = sum(1 for r in records if any(a.get("type") == "dflash" and a.get("enabled") for a in r["accelerators"]))
     jaccl = sum(1 for r in records if r["serve"]["backend"] == "jaccl")
