@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  model-kb recipe HTTP API — launchd template (macOS).
+
+  Not installed by anything in this repo; copy it into place yourself. The two
+  __PLACEHOLDERS__ are the only values to substitute, so nothing here pins a
+  home path or a node:
+
+    MODEL_KB_DIR   the model-kb install (e.g. "$(python3 -c 'import pathlib;print(pathlib.Path.home())')/.r1o/model-kb")
+    PYTHON3        the interpreter that runs engine/model-kb-http.py (the install's .venv/bin/python if it has one)
+
+  Then, as the user whose crontab runs pipeline.py (only that node may write):
+
+    mkdir -p ~/Library/LaunchAgents
+    sed -e "s|__MODEL_KB_DIR__|$HOME/.r1o/model-kb|" \
+        -e "s|__PYTHON3__|$(command -v python3)|" \
+        deploy/com.model-kb.http.plist.in > ~/Library/LaunchAgents/com.model-kb.http.plist
+    python3 "$HOME/.r1o/model-kb/model-kb-http.py" --init-token   # prints the token; it stays 0600
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.model-kb.http.plist
+
+  Port: MODEL_KB_HTTP_PORT, default 59710 (see docs/http-api.md). The listener
+  is loopback-only; the bearer token gates everything except /health.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.model-kb.http</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON3__</string>
+    <string>__MODEL_KB_DIR__/model-kb-http.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__MODEL_KB_DIR__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__MODEL_KB_DIR__/logs/http.log</string>
+  <key>StandardErrorPath</key>
+  <string>__MODEL_KB_DIR__/logs/http.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- Optional: pin the port here instead of the default in lib/modelkb_client.py. -->
+    <!-- <key>MODEL_KB_HTTP_PORT</key><string>59710</string> -->
+    <key>PYTHONDONTWRITEBYTECODE</key>
+    <string>1</string>
+  </dict>
+</dict>
+</plist>

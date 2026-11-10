@@ -42,3 +42,6 @@ engine/recipes.jsonl
 engine/recipes.snapshot.json
 engine/.ingest.lock
 engine/model_kb.db
+# HTTP API bearer token + its log — local secret, never committed
+engine/http-token
+engine/logs/

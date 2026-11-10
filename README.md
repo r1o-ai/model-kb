@@ -116,7 +116,10 @@ data/records.seed.jsonl      anonymized records (hostnames → node-N)
 schema/types.ts              TypeScript contract for a UI
 scripts/kb-guard.py          the destructive-ingest guard  ← read this one
 engine/model_kb.py           CLI: search / get / serving / load
-engine/model-kb-mcp.py       MCP server — 6 tools
+engine/model-kb-mcp.py       MCP server — 7 tools
+engine/model-kb-http.py      recipe HTTP API (loopback + bearer token)
+engine/lib/modelkb_client.py the HTTP client r1o and other consumers copy
+deploy/com.model-kb.http.plist.in  launchd template for the HTTP API
 engine/pipeline.py           full rebuild in the SAFE order
 engine/export_obsidian.py    records.jsonl → Obsidian notes
 engine/research-corpus.glob  which markdown ingest_research reads
@@ -164,10 +167,28 @@ Because recipes carry `known_issues` and measurements, queries phrased as *probl
 ```
 
 Tools: `model_search`, `model_get`, `model_family`, `model_serving`, `model_load`,
-`model_optimization_transfer`.
+`model_optimization_transfer`, `model_recipe_put`.
 
 ⚠️ `model_serving` and `model_load` talk to a **cluster control API** (asmi) that is specific
 to the originating deployment. Without it they fail; search/get/family/transfer work standalone.
+
+### Writing a recipe from outside model-kb
+
+`model_recipe_put` is stdio, so only an MCP client can reach it. Anything else — a web app,
+a shell script, a second Home — writes through model-kb's HTTP API instead:
+
+```bash
+python3 engine/model-kb-http.py --init-token      # <root>/http-token, 0600
+python3 engine/model-kb-http.py                   # 127.0.0.1:59710
+curl -s -X PUT -H "Authorization: Bearer $(cat engine/http-token)" \
+     -H 'Content-Type: application/json' \
+     -d '{"patch":{"sampling":{"temperature":0.2}}}' \
+     "http://127.0.0.1:59710/v1/recipes/meta-llama%2FLlama-3-8B/mlx_lm/user"
+```
+
+The server calls the same `recipe_store.put` (writer node only, `.ingest.lock`, snapshot
+re-export) and answers with the record plus the record read back. Routes, every status code
+and a copy-paste client: [`docs/http-api.md`](docs/http-api.md).
 
 ---
 
