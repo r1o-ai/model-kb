@@ -18,8 +18,10 @@ Live fleet corpus (not this repo): `~/.r1o/model-kb/records.jsonl`.
 
 - Never hand-write `records.jsonl`. Fix upstream, re-ingest. Recipes ingest clobbers.
 - Hand-made recipe data (research / benchmark / user override, keyed model × engine) goes ONLY through
-  `engine/recipe_store.py put` or MCP `model_recipe_put`, on the node whose crontab runs `pipeline.py`.
+  `engine/recipe_store.py put`, MCP `model_recipe_put`, or the HTTP API (`engine/model-kb-http.py`),
+  on the node whose crontab runs `pipeline.py`.
   It lives in `~/.r1o/model-kb/recipes.jsonl`; the pipeline folds it into every generation.
+  Other consumers write through the HTTP API — `docs/http-api.md`.
 - `~/.r1o/model-kb/recipes.snapshot.json` is GENERATED (0444) — the chat path reads it; never edit it.
 - Engines come from asmi `/serve/engines` across online nodes (`lib/engines.py`); a recipe whose engine no
   node declares is `servable: false` with a reason, never a pipeline failure.
